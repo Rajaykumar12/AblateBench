@@ -66,6 +66,7 @@ abliteration-eval/
 ├── modal_app.py              # Entry point — all Modal functions (prepare_data, extract,
 │                              # run_sweep, run_full_pipeline, flagship_run) + local_entrypoint
 ├── src/
+│   ├── model_utils.py        # Shared decoder-layer introspection, used by every stage below
 │   ├── extract_direction.py  # Activation extraction + per-layer direction computation
 │   ├── layer_sweep.py        # Layer/coefficient sweep
 │   ├── ablate_runtime.py     # Reversible forward-hook ablation
@@ -74,10 +75,12 @@ abliteration-eval/
 │   ├── eval_refusal.py       # Two-tier refusal grader (rule-based + judge fallback)
 │   └── eval_capability.py    # MCQ capability harness (ARC-Easy style)
 ├── data/
-│   ├── prepare_prompts.py         # Downloads/splits AdvBench + Alpaca (needs network)
-│   ├── build_eval_categories.py   # Generates ~292 category-labeled refusal-eval prompts
-│   └── eval_categories/           # Generated output, 12 categories
-├── tests/                    # 31 unit tests, pure PyTorch CPU, no GPU/network needed
+│   ├── prepare_prompts.py           # Downloads/splits AdvBench + Alpaca (needs network)
+│   ├── build_eval_categories.py     # Generates ~292 category-labeled refusal-eval prompts
+│   ├── build_capability_subset.py   # Real ARC-Easy sample (falls back to a static set offline)
+│   ├── eval_categories/             # Generated output, 12 categories
+│   └── capability_subset.json       # Generated output, 50-100 MCQ capability subset
+├── tests/                    # 35 unit tests, pure PyTorch CPU, no GPU/network needed
 └── requirements.txt
 ```
 
