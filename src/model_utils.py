@@ -77,6 +77,36 @@ def unwrap_hidden_state(output) -> torch.Tensor:
     return output
 
 
+def format_chat_prompt(tokenizer, prompt: str) -> str:
+    """Wrap a raw prompt in the model's chat template so an instruct model is asked
+    as an actual chat turn, not asked to continue raw text as if it were a base
+    model. This matters for *every* stage that feeds a prompt to the model:
+
+    - extraction (extract_direction.py): the "last token" residual-stream activation
+      should be captured right after the chat template opens the assistant turn -
+      the position where the model is about to decide how to respond, which is
+      where a refusal-mediating direction should be most salient. Capturing it at
+      the end of raw, un-templated instruction text is a different (and weaker)
+      signal.
+    - generation and judging (modal_app.py): an un-templated prompt can produce text
+      that doesn't look like a normal assistant response at all, especially for
+      models with a strict chat format (found via a live Llama-3.1-8B-Instruct run
+      where judge_fallback_rate hit ~90%, vs. ~20-27% for Qwen on the identical
+      code path, before this fix).
+
+    Falls back to the raw prompt if the tokenizer has no chat template (e.g. a base
+    model). Callers must tokenize the result with `add_special_tokens=False` - the
+    template's output already contains BOS/header tokens.
+    """
+    if getattr(tokenizer, "chat_template", None) is None:
+        return prompt
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
 def rewrap_hidden_state(output, new_hidden: torch.Tensor):
     """Inverse of unwrap_hidden_state — put a modified hidden state back into whatever
     shape the layer originally returned, so a forward hook can swap it in place."""
