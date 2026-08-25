@@ -1,0 +1,105 @@
+{
+  "source": "static_fallback",
+  "questions": [
+    {
+      "question": "What is the chemical symbol for water?",
+      "choices": [
+        "H2O",
+        "O2",
+        "CO2",
+        "NaCl"
+      ],
+      "answer_index": 0
+    },
+    {
+      "question": "What planet is known as the Red Planet?",
+      "choices": [
+        "Venus",
+        "Mars",
+        "Jupiter",
+        "Saturn"
+      ],
+      "answer_index": 1
+    },
+    {
+      "question": "How many continents are there on Earth?",
+      "choices": [
+        "5",
+        "6",
+        "7",
+        "8"
+      ],
+      "answer_index": 2
+    },
+    {
+      "question": "What is the boiling point of water at sea level in Celsius?",
+      "choices": [
+        "90",
+        "100",
+        "110",
+        "120"
+      ],
+      "answer_index": 1
+    },
+    {
+      "question": "Which gas do plants primarily absorb for photosynthesis?",
+      "choices": [
+        "Oxygen",
+        "Nitrogen",
+        "Carbon dioxide",
+        "Hydrogen"
+      ],
+      "answer_index": 2
+    },
+    {
+      "question": "What is the largest mammal in the world?",
+      "choices": [
+        "Elephant",
+        "Blue whale",
+        "Giraffe",
+        "Polar bear"
+      ],
+      "answer_index": 1
+    },
+    {
+      "question": "What is the freezing point of water in Fahrenheit?",
+      "choices": [
+        "0",
+        "32",
+        "100",
+        "212"
+      ],
+      "answer_index": 1
+    },
+    {
+      "question": "Which organ pumps blood through the human body?",
+      "choices": [
+        "Lungs",
+        "Liver",
+        "Heart",
+        "Kidney"
+      ],
+      "answer_index": 2
+    },
+    {
+      "question": "What is the speed of light approximately, in km/s?",
+      "choices": [
+        "300",
+        "3,000",
+        "30,000",
+        "300,000"
+      ],
+      "answer_index": 3
+    },
+    {
+      "question": "Which element has the atomic number 1?",
+      "choices": [
+        "Helium",
+        "Hydrogen",
+        "Oxygen",
+        "Carbon"
+      ],
+      "answer_index": 1
+    }
+  ]
+}
