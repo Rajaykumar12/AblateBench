@@ -104,21 +104,14 @@ def _load_json(path: str):
 
 
 def _format_chat(tokenizer, prompt: str) -> str:
-    """Wrap a raw prompt in the model's chat template so an instruct model is
-    actually being asked as a chat turn, not asked to continue raw text as if it
-    were a base model. Real bug found from a live Llama-3.1-8B-Instruct run:
-    judge_fallback_rate was ~90% (vs. ~20-27% for Qwen on the identical code path)
-    because ungenerated-chat-format prompts produced text that didn't look like a
-    normal assistant response at all - Llama's chat format is stricter than Qwen's,
-    so it degrades harder without it. Falls back to the raw prompt if the tokenizer
-    has no chat template (e.g. a base model)."""
-    if getattr(tokenizer, "chat_template", None) is None:
-        return prompt
-    return tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    """Delegates to model_utils.format_chat_prompt (also used by extract_direction.py,
+    so extraction and generation/judging apply the exact same chat formatting - see
+    that function's docstring for why this matters). The local import is required,
+    not just style: /root/src is only on sys.path after the caller has already run
+    _add_src_to_path(), which every caller of this function does first."""
+    from model_utils import format_chat_prompt
+
+    return format_chat_prompt(tokenizer, prompt)
 
 
 def _make_self_judge(model, tokenizer):
