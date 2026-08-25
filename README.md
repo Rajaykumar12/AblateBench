@@ -1,73 +1,119 @@
-# Mini-Abliteration + Refusal-Rate Eval Harness
+# abliteration-eval
 
-Reproduction/extension of the difference-in-means refusal-direction technique from
-Arditi et al., ["Refusal in Language Models Is Mediated by a Single
-Direction"](https://arxiv.org/abs/2406.11717) (arXiv:2406.11717, 2024; reference
-implementation: [github.com/andyrdt/refusal_direction](https://github.com/andyrdt/refusal_direction)).
-Full requirements, architecture, execution plan, and test strategy are in
-[`../abliteration-eval-prd.md`](../abliteration-eval-prd.md) — this README is filled
-in with real numbers as each pipeline stage completes on Modal, per PRD §11.
+Finds the internal "refuse this" direction in an open-weight LLM, removes it two ways (reversible hook / permanent weight edit), and proves the before/after tradeoff with a self-built refusal-rate + capability eval harness — all running on rented B200 GPUs via Modal.
 
-## Status
+`Python 3.11` · `PyTorch` · `Transformers` · `Modal (B200)` · `pytest`
 
-Implementation scaffold complete and unit-tested locally (29/29 tests passing,
-plus an end-to-end smoke test against a real `transformers` Llama architecture with
-random weights — see `tests/` and the smoke test referenced in the session log).
-**No GPU runs have executed yet** — the sections below are placeholders to be filled
-in once `modal run` stages complete on Modal's B200s.
+## Features
 
-## Running
+- **Difference-in-means direction extraction** — per-layer refusal direction computed from harmful (AdvBench) vs. harmless (Alpaca) activations, no gradients required
+- **Layer/coefficient sweep** — automatically shortlists candidate layers and ablation strengths, scored by refusal-rate drop vs. capability cost
+- **Two ablation methods** — a reversible forward-hook (`ablate_runtime.py`) and a permanent weight-level orthogonalization (`ablate_weights.py`), proven numerically equivalent in `tests/`
+- **Two-tier refusal grader** — cheap regex pass first, LLM-judge fallback (the model judging itself) only for ambiguous responses
+- **Capability regression guard** — every ablation variant is scored on an ARC-Easy multiple-choice subset so "suppressed refusal" can't secretly mean "broke the model"
+- **Modal-native orchestration** — one `modal_app.py` drives data prep, extraction, sweep, full pipeline, and a 30B+ flagship confirmation run, all cached in a shared `modal.Volume`
+
+## Quickstart
+
+### Prerequisites
+
+- Python 3.11
+- A [Modal](https://modal.com) account (compute runs on Modal's B200 GPUs, not locally)
+- A [Hugging Face](https://huggingface.co) account + access token (some models/datasets used here are gated)
+
+### Setup
 
 ```bash
-pip install -r requirements.txt
-modal setup                      # one-time auth (opens a browser to modal.com)
+git clone <this-repo-url>
+cd abliteration-eval
 
+pip install -r requirements.txt
+
+# One-time Modal auth (opens a browser)
+modal setup
+
+# Store your HF token as a Modal secret — see Environment Variables below
+modal secret create huggingface-secret HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
+```
+
+### Run
+
+```bash
+# 1. Pull real AdvBench/Alpaca/ARC-Easy data onto the shared volume (CPU only)
 modal run modal_app.py --stage prepare_data
+
+# 2. Extract the refusal direction for a model (first GPU spend)
 modal run modal_app.py --stage extract --model-name Qwen/Qwen2.5-7B-Instruct
+
+# 3. Sweep layers/coefficients to find the best ablation operating point
 modal run modal_app.py::run_sweep --model-name Qwen/Qwen2.5-7B-Instruct \
     --directions-path /cache/directions_Qwen_Qwen2.5-7B-Instruct.pt
-# inspect the sweep table, pick best (layer, coefficient), then:
-modal run modal_app.py::run_full_pipeline --model-name Qwen/Qwen2.5-7B-Instruct \
-    --best-layer <N> --best-coefficient <C>
+```
 
+## Environment Variables
+
+This project uses **Modal Secrets**, not a `.env` file — nothing reads `os.environ` directly except `HF_HOME`, which the code sets itself for cache placement.
+
+| Variable | Description | Default / Required |
+|---|---|---|
+| `HF_TOKEN` | Hugging Face access token, injected via the `huggingface-secret` Modal secret (`modal secret create huggingface-secret HF_TOKEN=...`). Required to download gated datasets (`walledai/AdvBench`) and gated models (e.g. Llama). | **Required** — no default; every `@app.function` in `modal_app.py` declares `secrets=[HF_SECRET]` |
+| `HF_HOME` | Where Hugging Face caches downloads inside the Modal container. | Set automatically to `/cache/huggingface` (on the persistent `abliteration-eval-cache` volume) — not user-configurable |
+
+## Project Structure
+
+```
+abliteration-eval/
+├── modal_app.py              # Entry point — all Modal functions (prepare_data, extract,
+│                              # run_sweep, run_full_pipeline, flagship_run) + local_entrypoint
+├── src/
+│   ├── extract_direction.py  # Activation extraction + per-layer direction computation
+│   ├── layer_sweep.py        # Layer/coefficient sweep
+│   ├── ablate_runtime.py     # Reversible forward-hook ablation
+│   ├── ablate_weights.py     # Permanent weight-level ablation
+│   ├── rescale.py            # Capability rescaling + tradeoff-curve tracking
+│   ├── eval_refusal.py       # Two-tier refusal grader (rule-based + judge fallback)
+│   └── eval_capability.py    # MCQ capability harness (ARC-Easy style)
+├── data/
+│   ├── prepare_prompts.py         # Downloads/splits AdvBench + Alpaca (needs network)
+│   ├── build_eval_categories.py   # Generates ~292 category-labeled refusal-eval prompts
+│   └── eval_categories/           # Generated output, 12 categories
+├── tests/                    # 31 unit tests, pure PyTorch CPU, no GPU/network needed
+└── requirements.txt
+```
+
+## Usage
+
+Run the full pipeline for one model once you have a winning (layer, coefficient) from the sweep:
+
+```bash
+modal run modal_app.py::run_full_pipeline \
+    --model-name Qwen/Qwen2.5-7B-Instruct \
+    --best-layer 21 --best-coefficient 1.0
+```
+
+Confirm the technique holds at 30B+ scale (extraction + both ablation methods only, no eval sweep):
+
+```bash
 modal run modal_app.py --stage flagship --model-name Qwen/Qwen2.5-32B-Instruct
 ```
 
-Local unit tests (no GPU/network needed):
+Check cost, logs, or cached data without leaving the terminal:
 
 ```bash
-python3.11 -m pytest tests/ -v
+modal app list                                     # recent runs
+modal app logs <app-id>                            # replay a run's full output
+modal volume ls abliteration-eval-cache            # inspect cached data/weights/results
 ```
 
-## Refusal-rate before/after (per category, per model)
+## Development & Testing
 
-_TODO — fill in after `run_full_pipeline` completes for both models._
+```bash
+# Run the full unit test suite (pure PyTorch, CPU-only, no GPU/network required)
+python3.11 -m pytest tests/ -v
 
-## Capability retention (with/without rescaling) — tradeoff curve
+# Syntax/import check without deploying
+python3.11 -m py_compile modal_app.py
+python3.11 -c "import modal_app"
+```
 
-_TODO — fill in from `results_<model>.json`'s `tradeoff_curve` field._
-
-## Per-layer sweep results
-
-_TODO — fill in from `sweep_result_<model>.json`._
-
-## Second-model divergence
-
-_TODO — what transferred from model 1's best (layer, coefficient), what didn't, and
-what was changed to compensate._
-
-## Flagship 30B+ confirmation
-
-_TODO — fill in from `flagship_run`'s summary (peak GPU memory, fraction of B200's
-~180GB HBM used)._
-
-## Grader validation
-
-_TODO — rule-based vs. manual-label agreement rate; judge-fallback invocation rate
-(PRD §9.2)._
-
-## Citation
-
-Arditi, A. et al., "Refusal in Language Models Is Mediated by a Single Direction,"
-arXiv:2406.11717 (2024). This project is a reproduction/extension at smaller scale
-with an added 30B+ confirmation run; it makes no claim of novel methodology.
+No linter or build step is configured — this is a script/pipeline project, not a packaged library.
