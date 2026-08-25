@@ -1,0 +1,9 @@
+# Runs inside Modal's B200 container image (see modal_app.py's Image spec) as well as
+# for local, CPU-only unit tests (torch is CPU-only locally; Modal installs a CUDA build).
+modal>=1.5.0
+torch>=2.4.0
+transformers>=4.44.0
+accelerate>=0.33.0
+datasets>=2.20.0
+numpy>=1.26.0
+pytest>=8.0.0
