@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from model_utils import get_decoder_layers, unwrap_hidden_state
+from model_utils import format_chat_prompt, get_decoder_layers, unwrap_hidden_state
 
 
 @dataclass
@@ -61,12 +61,16 @@ def extract_activations(
 
     handles = [layer.register_forward_hook(make_hook(i)) for i, layer in enumerate(layers)]
 
+    formatted_prompts = [format_chat_prompt(tokenizer, p) for p in prompts]
+
     all_layer_acts: list[list[torch.Tensor]] = [[] for _ in range(num_layers)]
     try:
-        for start in range(0, len(prompts), batch_size):
-            batch = prompts[start : start + batch_size]
+        for start in range(0, len(formatted_prompts), batch_size):
+            batch = formatted_prompts[start : start + batch_size]
+            # add_special_tokens=False: the chat template's output already contains
+            # BOS/header tokens - tokenizing again with defaults would double them.
             enc = tokenizer(
-                batch, return_tensors="pt", padding=True, truncation=True
+                batch, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False
             ).to(device)
             model(**enc)
             for layer_idx in range(num_layers):
