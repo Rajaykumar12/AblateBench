@@ -63,3 +63,17 @@ def test_tradeoff_point_judge_fallback_rate_defaults_to_zero():
     # existing callers that don't track this shouldn't need updating
     p = TradeoffPoint(1.0, "runtime", False, 0.5, 0.9)
     assert p.judge_fallback_rate == 0.0
+
+
+def test_tradeoff_curve_pareto_frontier_delegates_to_pareto_module():
+    points = [
+        TradeoffPoint(coefficient=1.0, method="runtime", renormalized=False, refusal_rate=0.30, capability_score=0.70),
+        TradeoffPoint(coefficient=0.7, method="runtime", renormalized=False, refusal_rate=0.10, capability_score=0.90),
+        TradeoffPoint(coefficient=0.5, method="runtime", renormalized=False, refusal_rate=0.05, capability_score=0.60),
+    ]
+    curve = TradeoffCurve(points=points)
+
+    frontier = curve.pareto_frontier()
+    assert points[0] not in frontier  # dominated by points[1]
+    assert points[1] in frontier
+    assert points[2] in frontier
