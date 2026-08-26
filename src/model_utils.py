@@ -107,6 +107,39 @@ def format_chat_prompt(tokenizer, prompt: str) -> str:
     )
 
 
+def snapshot_residual_write_weights(model: nn.Module) -> dict[int, dict]:
+    """Clone every decoder layer's residual-write module weights/biases (see
+    _RESIDUAL_WRITE_PROJECTIONS / get_residual_write_modules), so ablate_weights_'s
+    in-place edit can later be undone with restore_residual_write_weights.
+
+    ablate_weights_ mutates `proj.weight.data` (and `.bias.data`) in place with no
+    other undo path — this exists so run_full_pipeline can test plain vs.
+    norm-preserving weight ablation against the same originally-loaded checkpoint
+    without an expensive reload. Keyed by `id(module)` rather than a name/path so
+    restore doesn't depend on re-deriving the same lookup path (it must be applied to
+    the *same* model instance the snapshot was taken from).
+    """
+    snapshot = {}
+    for layer in get_decoder_layers(model):
+        for proj in get_residual_write_modules(layer):
+            snapshot[id(proj)] = {
+                "weight": proj.weight.data.clone(),
+                "bias": proj.bias.data.clone() if proj.bias is not None else None,
+            }
+    return snapshot
+
+
+def restore_residual_write_weights(model: nn.Module, snapshot: dict[int, dict]) -> None:
+    """Inverse of snapshot_residual_write_weights: copy the snapshotted tensors back
+    in place. Must be called on the same model instance the snapshot was taken from."""
+    for layer in get_decoder_layers(model):
+        for proj in get_residual_write_modules(layer):
+            saved = snapshot[id(proj)]
+            proj.weight.data.copy_(saved["weight"])
+            if proj.bias is not None:
+                proj.bias.data.copy_(saved["bias"])
+
+
 def rewrap_hidden_state(output, new_hidden: torch.Tensor):
     """Inverse of unwrap_hidden_state — put a modified hidden state back into whatever
     shape the layer originally returned, so a forward hook can swap it in place."""
