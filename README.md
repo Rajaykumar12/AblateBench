@@ -1,4 +1,4 @@
-# abliteration-eval
+# AblateBench
 
 Finds the internal "refuse this" direction in an open-weight LLM, removes it two ways (reversible hook / permanent weight edit), and proves the before/after tradeoff with a self-built refusal-rate + capability eval harness — all running on rented **NVIDIA Blackwell (B200)** GPUs via [Modal](https://modal.com).
 
@@ -103,7 +103,7 @@ flagship_run(30B+ model)                    (Modal, Blackwell B200)
 
 ```bash
 git clone <this-repo-url>
-cd abliteration-eval
+cd AblateBench
 
 pip install -r requirements.txt
 
@@ -239,7 +239,7 @@ This project uses **Modal Secrets**, not a `.env` file — nothing reads `os.env
 ## Project Structure
 
 ```
-abliteration-eval/
+AblateBench/
 ├── modal_app.py              # Entry point — all Modal functions (prepare_data, extract,
 │                              # run_sweep, run_full_pipeline, flagship_run) + local_entrypoint
 ├── src/
