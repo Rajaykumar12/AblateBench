@@ -50,6 +50,51 @@ modal run modal_app.py::run_sweep --model-name Qwen/Qwen2.5-7B-Instruct \
     --directions-path /cache/directions_Qwen_Qwen2.5-7B-Instruct.pt
 ```
 
+## Results (Qwen2.5-7B-Instruct)
+
+All numbers below are post chat-template-fix (see `docs/03-bugs-and-fixes.md`, Bug
+#3) and reflect the current best-known operating point, not the first thing tried.
+
+**Headline finding**: at **layer 16, coefficient 1.0**, permanent weight-level
+ablation drops refusal on a 292-prompt, 12-category eval set from a ~95-97%
+baseline down to:
+
+| direction variant | refusal rate | drop from baseline | capability |
+|---|---|---|---|
+| raw (plain difference-in-means) | 43.2% | ~52pp | 1.000 (unchanged) |
+| **purified** (Gram-Schmidt against the harmless direction) | **28.8%** | **~67pp** | 1.000 (unchanged) |
+
+Capability — measured on an independent ARC-Easy-style MCQ subset — never moves off
+1.000 in either case. The model isn't getting dumber; it's specifically losing the
+tendency to refuse.
+
+**Two things had to be discovered to get here, not just assumed:**
+
+1. **The direction generalizes across prompt phrasing much better than it first
+   appeared to.** An earlier run at layer 21 (picked by a sweep that only checked
+   AdvBench-style prompts) suppressed refusal by just 3.4-8.9pp on this same
+   templated eval set — looking like the technique barely worked outside its
+   training distribution. Layer 16 alone gets 52pp on identical prompts. Layer
+   *choice*, not just the direction itself, turned out to be the dominant factor.
+2. **Purifying the direction against the harmless-prompt direction (Gram-Schmidt)
+   adds a further ~15pp of suppression on top of that**, for free — same
+   activations already extracted, no extra GPU forward passes. It also turns an
+   illusory "0% refusal" result at layer 1 (which was actually just capability
+   collapsing into garbled text) into an honest no-op that leaves the model intact.
+3. A cheap per-layer signal-quality score (`SNR × (1 − cosine) × purity`, computed
+   from the same activations) correctly flags layers 0-13 as weak candidates before
+   spending any sweep GPU-time — though it's a coarse filter, not a fine-grained
+   ranker: it doesn't reliably pick the single best layer among the good ones.
+
+**Honest caveat**: these numbers rely heavily on the model's own self-judge tier
+(~96-97% of verdicts, vs. ~20-27% in earlier runs) rather than the cheap rule-based
+grader, and the weight-ablated method's judge runs on the same model that's already
+been permanently ablated — a known, not-yet-fixed asymmetry (the judge is a closure
+over the model object, and `ablate_weights_` mutates that object in place, so the
+"self-judge" for the permanently-ablated variant is judging its own already-altered
+output). Directionally consistent with the runtime-hook variant's numbers, but
+treat the exact percentage-point figures as provisional until that's resolved.
+
 ## Environment Variables
 
 This project uses **Modal Secrets**, not a `.env` file — nothing reads `os.environ` directly except `HF_HOME`, which the code sets itself for cache placement.
