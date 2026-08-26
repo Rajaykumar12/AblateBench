@@ -14,6 +14,8 @@ from dataclasses import dataclass
 
 import torch
 
+from pareto import pareto_frontier
+
 
 def renormalize_to_original_norm(h_ablated: torch.Tensor, h_original: torch.Tensor) -> torch.Tensor:
     """Rescale each ablated hidden-state vector's norm back to its pre-ablation norm,
@@ -60,6 +62,13 @@ class TradeoffCurve:
         if not candidates:
             return None
         return min(candidates, key=lambda p: p.refusal_rate)
+
+    def pareto_frontier(self) -> list[TradeoffPoint]:
+        """Full non-dominated subset of points on (refusal_rate, capability_score) —
+        see pareto.pareto_frontier for the dominance rule. Unlike
+        best_meeting_capability_floor(), this isn't filtered against a fixed floor; it
+        surfaces every point worth plotting on the tradeoff curve."""
+        return pareto_frontier(self.points)
 
     def as_table_rows(self) -> list[dict]:
         """Plain-dict rows, ready to drop into the README's tradeoff-curve table."""

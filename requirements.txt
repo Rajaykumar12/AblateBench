@@ -7,3 +7,8 @@ accelerate>=0.33.0
 datasets>=2.20.0
 numpy>=1.26.0
 pytest>=8.0.0
+
+# Optional, plotting-only local dependency for scripts/plot_pareto.py. Not needed on
+# Modal (plotting runs locally against a downloaded sweep_result_*.json) and not added
+# to modal_app.py's Image spec.
+matplotlib>=3.8.0

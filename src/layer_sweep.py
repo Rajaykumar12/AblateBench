@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from ablate_runtime import install_ablation_hooks, remove_hooks
+from pareto import pareto_frontier
 
 
 @dataclass
@@ -43,6 +44,12 @@ class SweepResult:
         if not passing:
             return None
         return max(passing, key=lambda c: c.capability_score)
+
+    def pareto_frontier(self) -> list[SweepCandidate]:
+        """Full non-dominated subset of candidates on (refusal_rate, capability_score)
+        — see pareto.pareto_frontier for the dominance rule. Unlike best(), this isn't
+        filtered against a fixed target; it surfaces every candidate worth considering."""
+        return pareto_frontier(self.candidates)
 
     def as_table_rows(self) -> list[dict]:
         return [

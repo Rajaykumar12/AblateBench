@@ -168,3 +168,19 @@ def test_sweep_ablates_candidate_direction_at_every_layer_not_just_its_source():
     assert seen_projected_by_layer[0] == 1.0  # layer 0 input: pre-hook, untouched
     assert abs(seen_projected_by_layer[1]) < 1e-5  # layer 1 input: post layer-0-hook
     assert abs(seen_projected_by_layer[2]) < 1e-5  # layer 2 input: still ablated
+
+
+def test_sweep_result_pareto_frontier_delegates_to_pareto_module():
+    from layer_sweep import SweepCandidate, SweepResult
+
+    candidates = [
+        SweepCandidate(layer_index=0, coefficient=1.0, refusal_rate=0.30, capability_score=0.70),
+        SweepCandidate(layer_index=1, coefficient=0.7, refusal_rate=0.10, capability_score=0.90),
+        SweepCandidate(layer_index=2, coefficient=0.5, refusal_rate=0.05, capability_score=0.60),
+    ]
+    result = SweepResult(candidates=candidates)
+
+    frontier = result.pareto_frontier()
+    assert candidates[0] not in frontier  # dominated by candidate 1
+    assert candidates[1] in frontier
+    assert candidates[2] in frontier
