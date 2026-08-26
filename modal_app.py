@@ -143,14 +143,24 @@ def _make_self_judge(model, tokenizer):
 
 
 @app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
-def extract_and_save_direction(model_name: str, output_name: str):
+def extract_and_save_direction(model_name: str, output_name: str, purified: bool = False):
     """Stages [2]+[3] for one model: extract activations on the train splits, compute
     per-layer directions, save to the volume for reuse by run_sweep / ablation stages
-    without re-running the (cheap, but non-zero) forward passes."""
+    without re-running the (cheap, but non-zero) forward passes.
+
+    When `purified=True`, also Gram-Schmidt-orthogonalizes the direction against the
+    harmless-mean direction (gap analysis #1 — tests whether the raw direction
+    absorbed prompt-phrasing-specific signal alongside the true refusal signal) and
+    saves it alongside the raw one as `directions_purified_{output_name}.pt`, so both
+    can be swept/compared rather than only the purified variant replacing the raw one.
+
+    Also prints the per-layer signal-quality table (gap analysis #3) unconditionally —
+    it's free, reusing the same activations already extracted here, no extra GPU cost.
+    """
     _add_src_to_path()
     import torch
 
-    from extract_direction import compute_directions, extract_activations
+    from extract_direction import compute_directions, extract_activations, layer_signal_quality
 
     model, tokenizer = _load_model_and_tokenizer(model_name)
 
@@ -159,17 +169,37 @@ def extract_and_save_direction(model_name: str, output_name: str):
 
     harmful_acts = extract_activations(model, tokenizer, harmful, device="cuda", batch_size=8)
     harmless_acts = extract_activations(model, tokenizer, harmless, device="cuda", batch_size=8)
-    directions = compute_directions(harmful_acts, harmless_acts)
+
+    scores = layer_signal_quality(harmful_acts, harmless_acts)
+    print("Per-layer signal quality (SNR * (1 - cosine) * purity):")
+    for layer_idx, score in enumerate(scores.tolist()):
+        print(f"  layer {layer_idx}: {score:.4f}")
 
     out_path = f"{CACHE_DIR}/directions_{output_name}.pt"
-    torch.save(directions, out_path)
+    if not purified:
+        directions = compute_directions(harmful_acts, harmless_acts)
+        torch.save(directions, out_path)
+        volume.commit()
+        print(f"Saved directions {tuple(directions.shape)} to {out_path}")
+        return out_path
+
+    raw, purified_directions = compute_directions(harmful_acts, harmless_acts, purified=True)
+    purified_out_path = f"{CACHE_DIR}/directions_purified_{output_name}.pt"
+    torch.save(raw, out_path)
+    torch.save(purified_directions, purified_out_path)
     volume.commit()
-    print(f"Saved directions {tuple(directions.shape)} to {out_path}")
-    return out_path
+    print(f"Saved raw directions {tuple(raw.shape)} to {out_path}")
+    print(f"Saved purified directions {tuple(purified_directions.shape)} to {purified_out_path}")
+    return out_path, purified_out_path
 
 
 @app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
-def run_sweep(model_name: str, directions_path: str):
+def run_sweep(
+    model_name: str,
+    directions_path: str,
+    layer_shortlist: str | None = None,
+    result_suffix: str = "",
+):
     """Stage [4]: layer/coefficient sweep on the held-out validation slice.
 
     Note: the judge call inside measure_refusal_rate runs while that candidate's
@@ -177,6 +207,14 @@ def run_sweep(model_name: str, directions_path: str):
     window) - acceptable for candidate *selection*, since the sweep only needs a
     relative ranking, not a publishable number. run_full_pipeline (the actually
     reported numbers) removes hooks before judging - see its comment below.
+
+    `layer_shortlist`: optional comma-separated layer indices (e.g. "21,22,23,27") to
+    override layer_sweep.default_layer_shortlist's evenly-spaced picks — useful when
+    extract_and_save_direction's printed signal-quality table flags high-scoring
+    layers the default even spacing would otherwise skip. Defaults to None (unchanged
+    behavior: even spacing).
+    `result_suffix`: appended to the output filename so a targeted re-sweep doesn't
+    overwrite the default sweep's result file.
     """
     _add_src_to_path()
     import torch
@@ -187,6 +225,10 @@ def run_sweep(model_name: str, directions_path: str):
 
     model, tokenizer = _load_model_and_tokenizer(model_name)
     directions = torch.load(directions_path, map_location="cuda")
+
+    parsed_layer_shortlist = (
+        [int(x) for x in layer_shortlist.split(",") if x.strip()] if layer_shortlist else None
+    )
 
     val_harmful = _load_json(f"{DATA_DIR}/harmful_prompts_heldout.json")[:50]
     cap_data = _load_json(f"{DATA_DIR}/capability_subset.json")
@@ -202,9 +244,11 @@ def run_sweep(model_name: str, directions_path: str):
     def measure_capability() -> float:
         return evaluate_capability(model, tokenizer, questions, device="cuda")
 
-    result = run_ablation_sweep(model, directions, measure_refusal_rate, measure_capability)
+    result = run_ablation_sweep(
+        model, directions, measure_refusal_rate, measure_capability, layer_shortlist=parsed_layer_shortlist
+    )
 
-    out_path = f"{CACHE_DIR}/sweep_result_{model_name.replace('/', '_')}.json"
+    out_path = f"{CACHE_DIR}/sweep_result_{model_name.replace('/', '_')}{result_suffix}.json"
     with open(out_path, "w") as f:
         json.dump(result.as_table_rows(), f, indent=2)
     volume.commit()
@@ -235,10 +279,24 @@ def _generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 128) -
 
 
 @app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
-def run_full_pipeline(model_name: str, best_layer: int, best_coefficient: float = 1.0):
+def run_full_pipeline(
+    model_name: str,
+    best_layer: int,
+    best_coefficient: float = 1.0,
+    directions_path: str | None = None,
+    result_suffix: str = "",
+):
     """Stages [5a]/[5b]/[6]/[7]/[8] for one model, given the sweep's chosen operating
     point. Produces the refusal-rate + capability tables and the tradeoff curve that
-    go straight into the README (PRD §11)."""
+    go straight into the README (PRD §11).
+
+    `directions_path`: optional override for which directions file to load — defaults
+    to the usual `directions_{tag}.pt` convention. Lets you point this at
+    `directions_purified_{tag}.pt` (or any other variant) without overwriting the
+    plain-tag file on the volume.
+    `result_suffix`: appended to the output filename so a purified (or otherwise
+    non-default) run doesn't overwrite the default run's results_{tag}.json.
+    """
     _add_src_to_path()
     import torch
 
@@ -250,7 +308,8 @@ def run_full_pipeline(model_name: str, best_layer: int, best_coefficient: float 
 
     model, tokenizer = _load_model_and_tokenizer(model_name)
     tag = model_name.replace("/", "_")
-    per_layer_directions = torch.load(f"{CACHE_DIR}/directions_{tag}.pt", map_location="cuda")
+    directions_path = directions_path or f"{CACHE_DIR}/directions_{tag}.pt"
+    per_layer_directions = torch.load(directions_path, map_location="cuda")
     num_layers = per_layer_directions.shape[0]
     # per layer_sweep.run_ablation_sweep: the sweep's chosen layer names *which*
     # direction to use, not where to intervene — broadcast it model-wide so this
@@ -329,7 +388,7 @@ def run_full_pipeline(model_name: str, best_layer: int, best_coefficient: float 
         "judge_fallback_rate_baseline": baseline_refusal.judge_fallback_rate,
     }
 
-    out_path = f"{CACHE_DIR}/results_{tag}.json"
+    out_path = f"{CACHE_DIR}/results_{tag}{result_suffix}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     volume.commit()
