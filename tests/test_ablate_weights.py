@@ -7,7 +7,12 @@ import torch
 import torch.nn as nn
 
 from ablate_runtime import project_out
-from ablate_weights import ablate_weights_, orthogonalize_bias, orthogonalize_matrix
+from ablate_weights import (
+    ablate_weights_,
+    orthogonalize_bias,
+    orthogonalize_matrix,
+    orthogonalize_matrix_norm_preserving,
+)
 from model_utils import get_residual_write_modules
 
 
@@ -109,3 +114,64 @@ def test_get_residual_write_modules_finds_both_projections():
     model = _TinyModel(hidden_dim=4, num_layers=1)
     modules = get_residual_write_modules(model.model.layers[0])
     assert len(modules) == 2
+
+
+def test_orthogonalize_matrix_norm_preserving_zeroes_projection_and_restores_norm():
+    torch.manual_seed(1)
+    out_features, in_features = 16, 10
+    W = torch.randn(out_features, in_features)
+    d_hat = torch.randn(out_features)
+    d_hat = d_hat / d_hat.norm()
+
+    W_prime = orthogonalize_matrix_norm_preserving(W, d_hat)
+
+    # exactness: d_hat^T W' must still be (numerically) zero.
+    assert torch.allclose(d_hat @ W_prime, torch.zeros(in_features), atol=1e-5)
+    # magnitude: Frobenius norm restored to the pre-ablation value.
+    assert torch.isclose(W_prime.norm(), W.norm(), atol=1e-4)
+
+
+def test_orthogonalize_matrix_norm_preserving_matches_plain_when_d_hat_already_orthogonal():
+    """When d_hat is already orthogonal to W's row space, orthogonalize_matrix is a
+    no-op (W' == W), so the norm-restoring scale factor should be ~1 and the
+    norm-preserving variant should match the plain one."""
+    torch.manual_seed(2)
+    in_features = 8
+    # Build W with only 3 nonzero singular directions in a 5-dim output space, then
+    # pick d_hat from the orthogonal complement of W's row space (column space of W^T).
+    out_features = 5
+    U, _, _ = torch.linalg.svd(torch.randn(out_features, out_features))
+    # use fewer output directions than out_features so a genuine null-space column exists
+    basis = U[:, :3]
+    W = basis @ torch.randn(3, in_features)
+    d_hat = U[:, 3]  # orthogonal to the row space's spanning basis -> d_hat^T W ~= 0
+    d_hat = d_hat / d_hat.norm()
+
+    plain = orthogonalize_matrix(W, d_hat)
+    norm_preserving = orthogonalize_matrix_norm_preserving(W, d_hat)
+
+    assert torch.allclose(plain, W, atol=1e-4)
+    assert torch.allclose(norm_preserving, plain, atol=1e-3)
+
+
+def test_ablate_weights_norm_preserving_ends_up_closer_to_original_norm():
+    torch.manual_seed(4)
+    hidden_dim = 12
+    direction = torch.randn(1, hidden_dim)
+    direction[0] = direction[0] / direction[0].norm()
+
+    model_plain = _TinyModel(hidden_dim=hidden_dim, num_layers=1)
+    model_np = _TinyModel(hidden_dim=hidden_dim, num_layers=1)
+    model_np.model.layers[0].self_attn.o_proj.weight.data.copy_(
+        model_plain.model.layers[0].self_attn.o_proj.weight.data
+    )
+    original_norm = model_plain.model.layers[0].self_attn.o_proj.weight.data.norm()
+
+    ablate_weights_(model_plain, direction, coefficient=1.0)
+    ablate_weights_(model_np, direction, coefficient=1.0, norm_preserving=True)
+
+    plain_norm = model_plain.model.layers[0].self_attn.o_proj.weight.data.norm()
+    np_norm = model_np.model.layers[0].self_attn.o_proj.weight.data.norm()
+
+    assert abs(np_norm - original_norm) < abs(plain_norm - original_norm)
+    assert torch.isclose(np_norm, original_norm, atol=1e-3)
