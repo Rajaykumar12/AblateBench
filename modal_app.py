@@ -1,6 +1,7 @@
 """Modal orchestration for the abliteration-eval pipeline (PRD §7 "Modal specifics").
 
-Functions map 1:1 onto PRD pipeline stages and all run with gpu="B200":
+Functions map 1:1 onto PRD pipeline stages and (with the exception of
+push_checkpoint_to_hub, pure I/O with no forward pass) all run with gpu="B200":
   prepare_data()          -> stage [1]  (needs HF Hub network access - fine on Modal)
   extract_activations()   -> stages [2]+[3]
   run_sweep()              -> stage [4]
@@ -8,6 +9,10 @@ Functions map 1:1 onto PRD pipeline stages and all run with gpu="B200":
   flagship_run()           -> stage 30B+ confirmation (extraction + both ablation
                                methods only, no eval sweep - PRD "Flagship
                                confirmation run")
+  push_checkpoint_to_hub() -> decoupled publish step for a checkpoint
+                               run_full_pipeline already saved (docs/08) - not part of
+                               the numbered PRD stages, called separately whenever the
+                               user is ready to publish
 
 A modal.Volume caches downloaded model weights across runs so repeated experiments
 don't re-download a 7-8B/30B+ checkpoint every invocation (PRD §6.2, "Compute
@@ -17,6 +22,7 @@ Usage (after `modal setup` has authenticated this machine):
     modal run modal_app.py::prepare_data
     modal run modal_app.py::run_full_pipeline --model-name Qwen/Qwen2.5-7B-Instruct
     modal run modal_app.py::flagship_run --model-name Qwen/Qwen2.5-32B-Instruct
+    modal run modal_app.py::push_checkpoint_to_hub --checkpoint-path /cache/checkpoints/... --repo-id you/model-name
 """
 from __future__ import annotations
 
@@ -101,6 +107,20 @@ def _load_model_and_tokenizer(model_name: str, device: str = "cuda"):
 def _load_json(path: str):
     with open(path) as f:
         return json.load(f)
+
+
+def _save_checkpoint(model, tokenizer, path: str) -> None:
+    """Write a weight-ablated model + tokenizer to `path` as a plain HF checkpoint
+    (safetensors), so the edit survives past this container's teardown and is loadable
+    with a bare `AutoModelForCausalLM.from_pretrained(path)` - no special loading code,
+    no dependency on this repo, at the cost of duplicating the full checkpoint on disk
+    per save (accepted: `save_checkpoint=False` by default keeps eval-only runs free
+    of this cost)."""
+    import os
+
+    os.makedirs(path, exist_ok=True)
+    model.save_pretrained(path, safe_serialization=True)
+    tokenizer.save_pretrained(path)
 
 
 def _format_chat(tokenizer, prompt: str) -> str:
@@ -285,6 +305,7 @@ def run_full_pipeline(
     best_coefficient: float = 1.0,
     directions_path: str | None = None,
     result_suffix: str = "",
+    save_checkpoint: bool = False,
 ):
     """Stages [5a]/[5b]/[6]/[7]/[8] for one model, given the sweep's chosen operating
     point. Produces the refusal-rate + capability tables and the tradeoff curve that
@@ -296,6 +317,11 @@ def run_full_pipeline(
     plain-tag file on the volume.
     `result_suffix`: appended to the output filename so a purified (or otherwise
     non-default) run doesn't overwrite the default run's results_{tag}.json.
+    `save_checkpoint`: when True, write the weight-ablated model + tokenizer to the
+    volume under `{CACHE_DIR}/checkpoints/{tag}/weight_coeff{best_coefficient}` so it
+    can be loaded standalone later or pushed to HF Hub via `push_checkpoint_to_hub`.
+    Defaults to False so eval-only runs keep today's cost/behavior (no extra disk
+    write, no extra volume.commit() payload).
     """
     _add_src_to_path()
     import torch
@@ -372,6 +398,12 @@ def run_full_pipeline(
         )
     )
 
+    checkpoints_saved = {}
+    if save_checkpoint:
+        checkpoint_path = f"{CACHE_DIR}/checkpoints/{tag}/weight_coeff{best_coefficient}"
+        _save_checkpoint(model, tokenizer, checkpoint_path)
+        checkpoints_saved["weight"] = checkpoint_path
+
     curve = TradeoffCurve(points=tradeoff_points)
 
     results = {
@@ -386,6 +418,7 @@ def run_full_pipeline(
         "weight_ablated_capability": weight_capability,
         "tradeoff_curve": curve.as_table_rows(),
         "judge_fallback_rate_baseline": baseline_refusal.judge_fallback_rate,
+        "checkpoints_saved": checkpoints_saved,
     }
 
     out_path = f"{CACHE_DIR}/results_{tag}{result_suffix}.json"
@@ -394,6 +427,32 @@ def run_full_pipeline(
     volume.commit()
     print(json.dumps(results, indent=2))
     return results
+
+
+@app.function(image=image, volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
+def push_checkpoint_to_hub(checkpoint_path: str, repo_id: str, private: bool = True):
+    """Decoupled publish step, invoked directly (`modal run
+    modal_app.py::push_checkpoint_to_hub --checkpoint-path ... --repo-id ...`), not
+    called from run_full_pipeline - saving a checkpoint and publishing it are
+    separate decisions the user makes at separate times (PRD/docs/08). No `gpu=`:
+    this only re-serializes an already-ablated checkpoint already on the volume and
+    uploads it, no forward pass needed, so it shouldn't cost GPU time.
+
+    Requires `huggingface-secret`'s HF_TOKEN to have *write* scope - the token this
+    project has been using so far was only ever needed for reading gated datasets/
+    models. Regenerate it with a "Write"-role token from
+    https://huggingface.co/settings/tokens before calling this:
+        modal secret create huggingface-secret HF_TOKEN=<write-scoped-token> --force
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    model.push_to_hub(repo_id, private=private)
+    tokenizer.push_to_hub(repo_id, private=private)
+    repo_url = f"https://huggingface.co/{repo_id}"
+    print(f"Pushed checkpoint to {repo_url}")
+    return repo_url
 
 
 @app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])

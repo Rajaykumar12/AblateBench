@@ -137,6 +137,16 @@ modal run modal_app.py::run_full_pipeline \
     --model-name Qwen/Qwen2.5-7B-Instruct \
     --best-layer 16 --best-coefficient 1.0
 
+# 4b. Same, but also save the weight-ablated checkpoint to the volume, add
+#     --save-checkpoint. Publishing it to HF Hub is a separate, opt-in step —
+#     push_checkpoint_to_hub is never called automatically by run_full_pipeline:
+modal run modal_app.py::run_full_pipeline \
+    --model-name Qwen/Qwen2.5-7B-Instruct \
+    --best-layer 16 --best-coefficient 1.0 --save-checkpoint
+modal run modal_app.py::push_checkpoint_to_hub \
+    --checkpoint-path /cache/checkpoints/Qwen_Qwen2.5-7B-Instruct/weight_coeff1.0 \
+    --repo-id your-username/qwen2.5-7b-abliterated
+
 # 5. Confirm the technique holds at 30B+ scale (no eval sweep, just a smoke check)
 modal run modal_app.py --stage flagship --model-name Qwen/Qwen2.5-32B-Instruct
 ```
@@ -211,6 +221,9 @@ treat the exact percentage-point figures as provisional until that's resolved.
   the existing Llama numbers predate that fix and are invalid.
 - **30B+ flagship confirmation run** — `flagship_run` exists but hasn't been
   executed yet; confirms the technique and memory footprint hold at flagship scale.
+- **Serving/inference** (a chat endpoint for a saved checkpoint) was explicitly
+  deferred when checkpoint-save + Hub-publish was added — see docs/08. If it comes
+  up later, the stated preference is a bearer-token-gated endpoint, not an open one.
 
 ## Development & Testing
 
@@ -233,7 +246,7 @@ This project uses **Modal Secrets**, not a `.env` file — nothing reads `os.env
 
 | Variable | Description | Default / Required |
 |---|---|---|
-| `HF_TOKEN` | Hugging Face access token, injected via the `huggingface-secret` Modal secret (`modal secret create huggingface-secret HF_TOKEN=...`). Required to download gated datasets (`walledai/AdvBench`) and gated models (e.g. Llama). | **Required** — no default; every `@app.function` in `modal_app.py` declares `secrets=[HF_SECRET]` |
+| `HF_TOKEN` | Hugging Face access token, injected via the `huggingface-secret` Modal secret (`modal secret create huggingface-secret HF_TOKEN=...`). Read access is enough for every function except `push_checkpoint_to_hub`, which needs a **write-scoped** token (regenerate the same secret with `--force` before publishing — see docs/04). | **Required** — no default; every `@app.function` in `modal_app.py` declares `secrets=[HF_SECRET]` |
 | `HF_HOME` | Where Hugging Face caches downloads inside the Modal container. | Set automatically to `/cache/huggingface` (on the persistent `abliteration-eval-cache` volume) — not user-configurable |
 
 ## Project Structure
@@ -241,7 +254,8 @@ This project uses **Modal Secrets**, not a `.env` file — nothing reads `os.env
 ```
 AblateBench/
 ├── modal_app.py              # Entry point — all Modal functions (prepare_data, extract,
-│                              # run_sweep, run_full_pipeline, flagship_run) + local_entrypoint
+│                              # run_sweep, run_full_pipeline, flagship_run,
+│                              # push_checkpoint_to_hub) + local_entrypoint
 ├── src/
 │   ├── model_utils.py        # Shared decoder-layer introspection, used by every stage below
 │   ├── extract_direction.py  # Activation extraction + per-layer direction computation,
