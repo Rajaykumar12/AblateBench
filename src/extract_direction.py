@@ -190,3 +190,70 @@ def layer_signal_quality(harmful: ActivationSet, harmless: ActivationSet) -> tor
     purity = residual.norm(dim=-1)  # refusal_dir has norm 1, so this is already a fraction
 
     return snr * (1 - cos) * purity
+
+
+@dataclass
+class MultiDomainDirections:
+    """Outputs of compute_multidomain_directions — see that function's docstring for
+    what each field means. `per_category` is unpurified, for inspection against
+    `universal` (do the per-category directions and the universal direction point in
+    similar or different places)."""
+
+    raw: torch.Tensor
+    purified: torch.Tensor
+    universal: torch.Tensor
+    per_category: dict[str, torch.Tensor]
+
+
+def compute_multidomain_directions(
+    harmful_by_category: dict[str, ActivationSet], harmless: ActivationSet
+) -> MultiDomainDirections:
+    """Fit a refusal direction from a harmful prompt pool spanning several topic
+    categories (data/build_extraction_categories.py), rather than a single
+    undifferentiated pool — and separate what's common across categories (`universal`)
+    from what's specific to any one of them (`per_category`).
+
+    1. Pool all categories' raw activations (concat along the prompt dim — categories
+       with more prompts get proportionally more weight, same reduction as a single
+       pool would give a larger category).
+    2. `raw` = unit-normalized pooled-harmful-mean minus harmless-mean, same
+       computation as compute_directions, sourced from the balanced multi-category pool.
+    3. `purified` = purify_direction(raw, harmless_mean) — reuses the existing
+       Gram-Schmidt-against-harmless logic unchanged.
+    4. For each category, its residual = its own harmful-mean minus the grand pooled
+       harmful-mean — what's specific to that category beyond the generic pooled signal.
+    5. `universal` = iteratively Gram-Schmidt `purified` against each category's
+       unit-normalized residual (sorted by category name for determinism), stripping
+       out whatever in the consensus direction is really just one category's
+       idiosyncrasy, leaving what's common across all categories.
+    6. `per_category[c]` = raw per-category direction (harmful-mean_c minus
+       harmless-mean), unpurified — for inspection against `universal`.
+
+    Degenerate case: with a single category, every category residual is the zero
+    vector (the category's own mean equals the grand pooled mean), so step 5 is a
+    no-op and `universal` exactly equals `purified` — matching
+    compute_directions(purified=True)'s output for that same pool.
+    """
+    pooled_activations = torch.cat(
+        [acts.activations for acts in harmful_by_category.values()], dim=1
+    )
+    pooled_harmful = ActivationSet(activations=pooled_activations)
+
+    raw, purified = compute_directions(pooled_harmful, harmless, purified=True)
+
+    pooled_harmful_mean, harmless_mean = _per_layer_means(pooled_harmful, harmless)
+
+    per_category: dict[str, torch.Tensor] = {}
+    residuals: dict[str, torch.Tensor] = {}
+    for category, acts in harmful_by_category.items():
+        category_mean = acts.activations.mean(dim=1)  # [num_layers, hidden_dim]
+        per_category[category] = _unit_normalize(category_mean - harmless_mean)
+        residuals[category] = _unit_normalize(category_mean - pooled_harmful_mean)
+
+    universal = purified
+    for category in sorted(residuals):
+        universal = _unit_normalize(_project_out(universal, residuals[category]))
+
+    return MultiDomainDirections(
+        raw=raw, purified=purified, universal=universal, per_category=per_category
+    )

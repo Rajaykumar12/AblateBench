@@ -7,6 +7,7 @@ import torch.nn as nn
 from extract_direction import (
     ActivationSet,
     compute_directions,
+    compute_multidomain_directions,
     extract_activations,
     layer_signal_quality,
     purify_direction,
@@ -138,6 +139,136 @@ def test_layer_signal_quality_ranks_high_snr_layer_above_low_snr_layer():
 
     assert scores.shape == (2,)
     assert scores[0] > scores[1]
+
+
+def test_multidomain_pooling_concatenates_correctly():
+    """Pooled activations must be the concatenation of every category's activations
+    along the prompt dim, so a category with more prompts gets proportionally more
+    weight in the pooled mean (same reduction a single undifferentiated pool would
+    give a larger category)."""
+    torch.manual_seed(10)
+    num_layers, hidden_dim = 2, 5
+
+    cat_a = ActivationSet(activations=torch.randn(num_layers, 30, hidden_dim))
+    cat_b = ActivationSet(activations=torch.randn(num_layers, 10, hidden_dim))
+    harmless = ActivationSet(activations=torch.randn(num_layers, 20, hidden_dim) * 0.01)
+
+    result = compute_multidomain_directions({"cat_a": cat_a, "cat_b": cat_b}, harmless)
+
+    assert result.raw.shape == (num_layers, hidden_dim)
+    assert result.purified.shape == (num_layers, hidden_dim)
+    assert result.universal.shape == (num_layers, hidden_dim)
+    assert set(result.per_category.keys()) == {"cat_a", "cat_b"}
+
+    # raw must match compute_directions on the manually pooled (concatenated) set.
+    pooled = ActivationSet(
+        activations=torch.cat([cat_a.activations, cat_b.activations], dim=1)
+    )
+    expected_raw = compute_directions(pooled, harmless)
+    assert torch.allclose(result.raw, expected_raw, atol=1e-5)
+
+
+def test_multidomain_universal_isolates_shared_axis_while_per_category_retains_idiosyncrasies():
+    """Synthetic 4-axis setup: axis 0 is the harmless axis, axis 1 is a "common
+    refusal" signal shared by every category, axes 2/3 are idiosyncratic to
+    category A/B respectively (plus a third category C on axis 4's-worth of its own
+    idiosyncrasy, so there's more than one independent category-difference direction
+    to Gram-Schmidt against — with only 2 categories, their residuals are always
+    exactly anti-parallel, so a 2nd projection is a no-op and only the *difference*
+    between the two categories' idiosyncrasies gets removed, not each one fully).
+
+    Checks the two guarantees compute_multidomain_directions actually makes:
+    (1) universal is (near) orthogonal to every category's own residual direction —
+    the literal Gram-Schmidt invariant, same style of check as
+    test_purify_direction_*'s orthogonality assertions; and
+    (2) per_category directions retain a strong component along their own
+    idiosyncratic axis, much more so than universal does.
+    """
+    torch.manual_seed(11)
+    num_layers, hidden_dim = 1, 6
+    noise = 0.01
+
+    axes = list(torch.eye(hidden_dim))
+    axis0, axis1, axis2, axis3, axis4 = axes[0], axes[1], axes[2], axes[3], axes[4]
+
+    def _acts(mean_offset: torch.Tensor, num_prompts: int) -> ActivationSet:
+        base = torch.randn(num_layers, num_prompts, hidden_dim) * noise
+        return ActivationSet(activations=base + mean_offset.view(1, 1, hidden_dim))
+
+    harmless_offset = 3.0 * axis0
+    harmless = _acts(harmless_offset, num_prompts=200)
+
+    # all three categories share axis1 (the "common refusal" signal); each also
+    # carries its own idiosyncratic axis (2 for A, 3 for B, 4 for C).
+    cat_a_offset = harmless_offset + 2.0 * axis1 + 1.0 * axis2
+    cat_b_offset = harmless_offset + 2.0 * axis1 + 1.0 * axis3
+    cat_c_offset = harmless_offset + 2.0 * axis1 + 1.0 * axis4
+    cat_a = _acts(cat_a_offset, num_prompts=200)
+    cat_b = _acts(cat_b_offset, num_prompts=150)
+    cat_c = _acts(cat_c_offset, num_prompts=100)
+
+    harmful_by_category = {"cat_a": cat_a, "cat_b": cat_b, "cat_c": cat_c}
+    result = compute_multidomain_directions(harmful_by_category, harmless)
+
+    # (1) recompute each category's residual against the pooled mean exactly as
+    # compute_multidomain_directions does. The *last* category processed (sorted by
+    # name -> "cat_c") is exactly orthogonal to universal, since nothing runs after
+    # it to reintroduce a component; earlier categories (single-pass, not iterated to
+    # convergence, unlike modified Gram-Schmidt) end up only near-orthogonal, since a
+    # later projection can partially reintroduce a small component along an earlier,
+    # non-orthogonal residual direction.
+    pooled = torch.cat([acts.activations for acts in harmful_by_category.values()], dim=1)
+    pooled_mean = pooled.mean(dim=1)  # [num_layers, hidden_dim]
+    for category_name, acts in harmful_by_category.items():
+        category_mean = acts.activations.mean(dim=1)
+        residual_hat = category_mean - pooled_mean
+        residual_hat = residual_hat / residual_hat.norm(dim=-1, keepdim=True)
+        dot = (result.universal * residual_hat).sum(dim=-1)
+        tol = 1e-4 if category_name == "cat_c" else 1e-2
+        assert torch.allclose(dot, torch.zeros_like(dot), atol=tol)
+
+    def cos_to_axis(vec: torch.Tensor, axis: torch.Tensor) -> float:
+        return torch.nn.functional.cosine_similarity(
+            vec[0].unsqueeze(0), axis.unsqueeze(0)
+        ).item()
+
+    # (2) per_category directions retain their own category's idiosyncratic axis far
+    # more strongly than universal does.
+    assert abs(cos_to_axis(result.per_category["cat_a"], axis2)) > abs(
+        cos_to_axis(result.universal, axis2)
+    )
+    assert abs(cos_to_axis(result.per_category["cat_b"], axis3)) > abs(
+        cos_to_axis(result.universal, axis3)
+    )
+    assert abs(cos_to_axis(result.per_category["cat_c"], axis4)) > abs(
+        cos_to_axis(result.universal, axis4)
+    )
+
+
+def test_multidomain_single_category_matches_compute_directions_purified():
+    """Degenerate case: with one category, its residual against the pooled mean is
+    the zero vector, so the universal Gram-Schmidt pass is a no-op and universal
+    should exactly equal purified, and raw/purified should exactly match
+    compute_directions(purified=True) on that same pool."""
+    torch.manual_seed(12)
+    num_layers, num_prompts, hidden_dim = 2, 40, 6
+
+    harmless_acts = torch.randn(num_layers, num_prompts, hidden_dim) * 0.01
+    harmless_acts[:, :, 0] += 3.0
+    harmful_acts = harmless_acts.clone()
+    harmful_acts[:, :, 0] += 2.0
+    harmful_acts[:, :, 1] += 4.0
+
+    harmful = ActivationSet(activations=harmful_acts)
+    harmless = ActivationSet(activations=harmless_acts)
+
+    expected_raw, expected_purified = compute_directions(harmful, harmless, purified=True)
+
+    result = compute_multidomain_directions({"only_category": harmful}, harmless)
+
+    assert torch.allclose(result.raw, expected_raw, atol=1e-5)
+    assert torch.allclose(result.purified, expected_purified, atol=1e-5)
+    assert torch.allclose(result.universal, expected_purified, atol=1e-5)
 
 
 class _FakeBatchEncoding(dict):
