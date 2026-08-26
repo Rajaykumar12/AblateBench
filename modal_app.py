@@ -80,13 +80,26 @@ def prepare_data(num_harmful: int = 300, num_harmless: int = 300, num_capability
     print(f"Data prepared under {DATA_DIR}")
 
 
-def _load_model_and_tokenizer(model_name: str, device: str = "cuda"):
+def _load_model_and_tokenizer(model_name: str, device: str = "cuda", compile_model: bool = False):
+    """`compile_model=True` wraps the loaded model in torch.compile(mode="reduce-overhead").
+
+    Scoped narrowly and opt-in: only extract_and_save_direction's stable,
+    hooks-installed-once forward pass is a safe fit for this. run_sweep /
+    run_full_pipeline's generation path installs/removes a fresh hook set for every
+    (layer, coefficient) candidate — reduce-overhead's CUDA graphs are fragile against
+    hooks that change between calls and will likely recompile (i.e. go slower) rather
+    than help, so those callers must not pass compile_model=True. The Inductor cache
+    dir is set unconditionally (cheap, no-op when compile_model=False) so it persists
+    on the already-mounted /cache volume across cold starts, since every caller
+    already calls volume.commit().
+    """
     import os
 
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     os.environ["HF_HOME"] = HF_CACHE_DIR
+    os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", f"{CACHE_DIR}/inductor_cache")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -95,6 +108,11 @@ def _load_model_and_tokenizer(model_name: str, device: str = "cuda"):
         model_name, dtype=torch.bfloat16, device_map=device
     )
     model.eval()
+    if compile_model:
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+        except Exception as e:  # noqa: BLE001 - degrade to eager, never fail the run
+            print(f"torch.compile failed ({e!r}); continuing eager")
     return model, tokenizer
 
 
@@ -143,7 +161,13 @@ def _make_self_judge(model, tokenizer):
 
 
 @app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
-def extract_and_save_direction(model_name: str, output_name: str, purified: bool = False):
+def extract_and_save_direction(
+    model_name: str,
+    output_name: str,
+    purified: bool = False,
+    multidomain: bool = False,
+    compile_model: bool = False,
+):
     """Stages [2]+[3] for one model: extract activations on the train splits, compute
     per-layer directions, save to the volume for reuse by run_sweep / ablation stages
     without re-running the (cheap, but non-zero) forward passes.
@@ -154,15 +178,36 @@ def extract_and_save_direction(model_name: str, output_name: str, purified: bool
     saves it alongside the raw one as `directions_purified_{output_name}.pt`, so both
     can be swept/compared rather than only the purified variant replacing the raw one.
 
+    When `multidomain=True`, additionally extracts activations per-category from
+    data/extraction_categories/*.json (built by data/build_extraction_categories.py —
+    deliberately disjoint from the single-pool harmful_prompts_train.json used above,
+    and from data/eval_categories/ used for evaluation) and saves
+    `directions_multidomain_{output_name}.pt`, a MultiDomainDirections
+    (raw/purified/universal/per_category — see extract_direction.compute_multidomain_directions).
+    Additive/opt-in, same pattern as `purified`; doesn't affect the plain or purified
+    outputs above.
+
     Also prints the per-layer signal-quality table (gap analysis #3) unconditionally —
     it's free, reusing the same activations already extracted here, no extra GPU cost.
+
+    `compile_model=True` wraps the model in torch.compile before running the forward
+    passes below — see _load_model_and_tokenizer's docstring for why this is scoped
+    to extraction only. Verification is Modal-only (GPU numerics): run once with
+    compile_model=False and once with True on the same model, torch.allclose(...,
+    atol=1e-2) the saved direction tensors, and compare wall-clock time, before ever
+    making compile_model=True a default anywhere.
     """
     _add_src_to_path()
     import torch
 
-    from extract_direction import compute_directions, extract_activations, layer_signal_quality
+    from extract_direction import (
+        compute_directions,
+        compute_multidomain_directions,
+        extract_activations,
+        layer_signal_quality,
+    )
 
-    model, tokenizer = _load_model_and_tokenizer(model_name)
+    model, tokenizer = _load_model_and_tokenizer(model_name, compile_model=compile_model)
 
     harmful = _load_json(f"{DATA_DIR}/harmful_prompts_train.json")
     harmless = _load_json(f"{DATA_DIR}/harmless_prompts_train.json")
@@ -179,18 +224,39 @@ def extract_and_save_direction(model_name: str, output_name: str, purified: bool
     if not purified:
         directions = compute_directions(harmful_acts, harmless_acts)
         torch.save(directions, out_path)
-        volume.commit()
         print(f"Saved directions {tuple(directions.shape)} to {out_path}")
-        return out_path
+        result = out_path
+    else:
+        raw, purified_directions = compute_directions(harmful_acts, harmless_acts, purified=True)
+        purified_out_path = f"{CACHE_DIR}/directions_purified_{output_name}.pt"
+        torch.save(raw, out_path)
+        torch.save(purified_directions, purified_out_path)
+        print(f"Saved raw directions {tuple(raw.shape)} to {out_path}")
+        print(f"Saved purified directions {tuple(purified_directions.shape)} to {purified_out_path}")
+        result = out_path, purified_out_path
 
-    raw, purified_directions = compute_directions(harmful_acts, harmless_acts, purified=True)
-    purified_out_path = f"{CACHE_DIR}/directions_purified_{output_name}.pt"
-    torch.save(raw, out_path)
-    torch.save(purified_directions, purified_out_path)
+    if multidomain:
+        import os
+
+        category_dir = "/root/data/extraction_categories"
+        harmful_by_category = {}
+        for fname in os.listdir(category_dir):
+            if fname == "_index.json":
+                continue
+            category = fname.replace(".json", "")
+            category_prompts = _load_json(f"{category_dir}/{fname}")
+            harmful_by_category[category] = extract_activations(
+                model, tokenizer, category_prompts, device="cuda", batch_size=8
+            )
+
+        multidomain_directions = compute_multidomain_directions(harmful_by_category, harmless_acts)
+        multidomain_out_path = f"{CACHE_DIR}/directions_multidomain_{output_name}.pt"
+        torch.save(multidomain_directions, multidomain_out_path)
+        print(f"Saved multidomain directions to {multidomain_out_path}")
+        print(f"  categories: {sorted(harmful_by_category.keys())}")
+
     volume.commit()
-    print(f"Saved raw directions {tuple(raw.shape)} to {out_path}")
-    print(f"Saved purified directions {tuple(purified_directions.shape)} to {purified_out_path}")
-    return out_path, purified_out_path
+    return result
 
 
 @app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
@@ -304,6 +370,7 @@ def run_full_pipeline(
     from ablate_weights import ablate_weights_
     from eval_capability import MCQuestion, evaluate_capability
     from eval_refusal import evaluate_refusal_by_category
+    from model_utils import restore_residual_write_weights, snapshot_residual_write_weights
     from rescale import TradeoffCurve, TradeoffPoint
 
     model, tokenizer = _load_model_and_tokenizer(model_name)
@@ -361,6 +428,11 @@ def run_full_pipeline(
     # (no hooks to remove - the edit is in the weights themselves, so the judge here
     # necessarily runs on the same altered model that generated the responses, which
     # is correct: that's what would actually be shipped.)
+    # Snapshot first so the norm-preserving pass below can run against the same
+    # originally-loaded checkpoint without an expensive reload (ablate_weights_
+    # mutates in place with no other undo path).
+    weight_snapshot = snapshot_residual_write_weights(model)
+
     ablate_weights_(model, directions, coefficient=best_coefficient)
     weight_responses = {c: _generate(model, tokenizer, p) for c, p in category_prompts.items()}
     weight_capability = evaluate_capability(model, tokenizer, questions, device="cuda")
@@ -369,6 +441,23 @@ def run_full_pipeline(
         TradeoffPoint(
             best_coefficient, "weight", False, weight_refusal.aggregate_refusal_rate, weight_capability,
             judge_fallback_rate=weight_refusal.judge_fallback_rate,
+        )
+    )
+
+    # --- permanent weight-level ablation, norm-preserving variant (gap #2) ---
+    # Restore to the pre-ablation checkpoint, then repeat at the same coefficient with
+    # the Frobenius-norm-restoring variant (see ablate_weights.orthogonalize_matrix_norm_preserving
+    # for why magnitude restoration must be a single global scalar per matrix here).
+    restore_residual_write_weights(model, weight_snapshot)
+    ablate_weights_(model, directions, coefficient=best_coefficient, norm_preserving=True)
+    weight_np_responses = {c: _generate(model, tokenizer, p) for c, p in category_prompts.items()}
+    weight_np_capability = evaluate_capability(model, tokenizer, questions, device="cuda")
+    weight_np_refusal = evaluate_refusal_by_category(weight_np_responses, judge_fn=judge_fn)
+    tradeoff_points.append(
+        TradeoffPoint(
+            best_coefficient, "weight_norm_preserved", False,
+            weight_np_refusal.aggregate_refusal_rate, weight_np_capability,
+            judge_fallback_rate=weight_np_refusal.judge_fallback_rate,
         )
     )
 
