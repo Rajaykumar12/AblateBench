@@ -80,7 +80,7 @@ abliteration-eval/
 │   ├── build_capability_subset.py   # Real ARC-Easy sample (falls back to a static set offline)
 │   ├── eval_categories/             # Generated output, 12 categories
 │   └── capability_subset.json       # Generated output, 50-100 MCQ capability subset
-├── tests/                    # 35 unit tests, pure PyTorch CPU, no GPU/network needed
+├── tests/                    # 39 unit tests, pure PyTorch CPU, no GPU/network needed
 └── requirements.txt
 ```
 
