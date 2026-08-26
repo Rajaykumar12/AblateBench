@@ -4,7 +4,13 @@ unit-norm."""
 import torch
 import torch.nn as nn
 
-from extract_direction import ActivationSet, compute_directions, extract_activations
+from extract_direction import (
+    ActivationSet,
+    compute_directions,
+    extract_activations,
+    layer_signal_quality,
+    purify_direction,
+)
 
 
 def test_direction_matches_known_mean_difference():
@@ -55,6 +61,83 @@ def test_mismatched_layer_counts_raise():
         assert False, "expected ValueError for mismatched layer counts"
     except ValueError:
         pass
+
+
+def test_purify_direction_orthogonal_input_is_noop():
+    # refusal_dir already has zero component along harmless_mean -> purification
+    # should leave it (up to sign/normalization) unchanged.
+    harmless_mean = torch.tensor([[1.0, 0.0, 0.0]])
+    refusal_dir = torch.tensor([[0.0, 1.0, 0.0]])
+
+    purified = purify_direction(refusal_dir, harmless_mean)
+
+    assert torch.allclose(purified, refusal_dir, atol=1e-5)
+
+
+def test_purify_direction_parallel_input_is_zeroed():
+    # refusal_dir points exactly along harmless_mean -> nothing survives
+    # Gram-Schmidt against it, so the purified direction should be the zero vector
+    # (compute_directions's existing degenerate-layer convention).
+    harmless_mean = torch.tensor([[2.0, 0.0, 0.0]])
+    refusal_dir = torch.tensor([[1.0, 0.0, 0.0]])
+
+    purified = purify_direction(refusal_dir, harmless_mean)
+
+    assert torch.allclose(purified, torch.zeros_like(purified), atol=1e-5)
+
+
+def test_compute_directions_purified_returns_raw_and_purified():
+    torch.manual_seed(1)
+    num_layers, num_prompts, hidden_dim = 2, 40, 6
+
+    # harmless mean offset along dim 0; refusal signal mixes in a dim-0 component
+    # (which purification should strip) alongside a genuine dim-1 signal.
+    harmless_acts = torch.randn(num_layers, num_prompts, hidden_dim) * 0.01
+    harmless_acts[:, :, 0] += 3.0
+    harmful_acts = harmless_acts.clone()
+    harmful_acts[:, :, 0] += 2.0  # shares harmless's dim-0 axis
+    harmful_acts[:, :, 1] += 4.0  # genuine refusal-specific signal
+
+    harmful = ActivationSet(activations=harmful_acts)
+    harmless = ActivationSet(activations=harmless_acts)
+
+    raw, purified = compute_directions(harmful, harmless, purified=True)
+
+    assert raw.shape == (num_layers, hidden_dim)
+    assert purified.shape == (num_layers, hidden_dim)
+    # unpurified default behavior is unaffected
+    assert torch.allclose(raw, compute_directions(harmful, harmless))
+    # purified direction has (near) zero dot product against the harmless direction
+    harmless_hat = harmless.activations.mean(dim=1)
+    harmless_hat = harmless_hat / harmless_hat.norm(dim=-1, keepdim=True)
+    dots = (purified * harmless_hat).sum(dim=-1)
+    assert torch.allclose(dots, torch.zeros_like(dots), atol=1e-4)
+
+
+def test_layer_signal_quality_ranks_high_snr_layer_above_low_snr_layer():
+    torch.manual_seed(2)
+    num_prompts, hidden_dim = 40, 6
+
+    # Layer 0: large, orthogonal harmful/harmless means -> high SNR, low cosine,
+    # high purity -> should score highest.
+    good_harmless = torch.randn(num_prompts, hidden_dim) * 0.01
+    good_harmless[:, 0] += 3.0
+    good_harmful = good_harmless.clone()
+    good_harmful[:, 1] += 5.0
+
+    # Layer 1: harmful/harmless means nearly coincide (small, noisy diff) -> low SNR
+    # -> should score lowest.
+    bad_harmless = torch.randn(num_prompts, hidden_dim) * 0.01
+    bad_harmless[:, 0] += 3.0
+    bad_harmful = bad_harmless + torch.randn(num_prompts, hidden_dim) * 0.001
+
+    harmful = ActivationSet(activations=torch.stack([good_harmful, bad_harmful]))
+    harmless = ActivationSet(activations=torch.stack([good_harmless, bad_harmless]))
+
+    scores = layer_signal_quality(harmful, harmless)
+
+    assert scores.shape == (2,)
+    assert scores[0] > scores[1]
 
 
 class _FakeBatchEncoding(dict):
