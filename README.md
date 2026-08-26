@@ -1,27 +1,105 @@
 # abliteration-eval
 
-Finds the internal "refuse this" direction in an open-weight LLM, removes it two ways (reversible hook / permanent weight edit), and proves the before/after tradeoff with a self-built refusal-rate + capability eval harness — all running on rented B200 GPUs via Modal.
+Finds the internal "refuse this" direction in an open-weight LLM, removes it two ways (reversible hook / permanent weight edit), and proves the before/after tradeoff with a self-built refusal-rate + capability eval harness — all running on rented **NVIDIA Blackwell (B200)** GPUs via [Modal](https://modal.com).
 
-`Python 3.11` · `PyTorch` · `Transformers` · `Modal (B200)` · `pytest`
+`Python 3.11` · `PyTorch` · `Transformers` · `Modal` · `NVIDIA Blackwell (B200)` · `pytest`
 
-## Features
+## Why this project exists
 
-- **Difference-in-means direction extraction** — per-layer refusal direction computed from harmful (AdvBench) vs. harmless (Alpaca) activations, no gradients required
-- **Layer/coefficient sweep** — automatically shortlists candidate layers and ablation strengths, scored by refusal-rate drop vs. capability cost
-- **Two ablation methods** — a reversible forward-hook (`ablate_runtime.py`) and a permanent weight-level orthogonalization (`ablate_weights.py`), proven numerically equivalent in `tests/`
-- **Two-tier refusal grader** — cheap regex pass first, LLM-judge fallback (the model judging itself) only for ambiguous responses
-- **Capability regression guard** — every ablation variant is scored on an ARC-Easy multiple-choice subset so "suppressed refusal" can't secretly mean "broke the model"
-- **Modal-native orchestration** — one `modal_app.py` drives data prep, extraction, sweep, full pipeline, and a 30B+ flagship confirmation run, all cached in a shared `modal.Volume`
+This reproduces, at small-to-medium scale, the **difference-in-means refusal
+direction** technique from Arditi et al., ["Refusal in Language Models Is Mediated
+by a Single Direction"](https://arxiv.org/abs/2406.11717) (arXiv:2406.11717) — the
+technique the open-source community calls "abliteration." It's explicitly a
+reproduction/extension exercise, not a claim of novel technique.
+
+The interesting part isn't producing a de-refused checkpoint (plenty of tools do
+that already) — it's the **eval harness around it**: a two-tier refusal grader, an
+independent capability-regression guard, a layer/coefficient sweep, and a tradeoff
+curve, all self-built and reported honestly, including the failures and dead ends
+along the way. If a result looks too good (e.g. a layer that "suppresses" 98% of
+refusals but only because it broke the model's coherence), that gets caught and
+reported as a finding, not quietly dropped.
+
+## Architecture
+
+```
+prepare_data()                              (Modal, CPU only)
+  -> data/{harmful,harmless}_prompts_{train,heldout}.json
+  -> data/capability_subset.json
+       written to /cache/data on a shared Modal Volume
+            |
+            v
+extract_and_save_direction(model, purified=False)     (Modal, Blackwell B200)
+  extract_activations() on train prompts (single forward pass per prompt)
+  -> compute_directions() -> per-layer unit directions [num_layers, hidden_dim]
+  -> layer_signal_quality() printed (free — same activations, no extra GPU cost)
+  saved to /cache/directions_<model>.pt
+  if purified=True: also purify_direction() (Gram-Schmidt against the
+    harmless-mean direction) -> /cache/directions_purified_<model>.pt
+    (raw AND purified both saved, so both can be swept/compared)
+            |
+            v
+run_sweep(model, directions_path)           (Modal, Blackwell B200)
+  for each candidate layer:
+    broadcast that ONE layer's direction to every layer of the model
+    for each coefficient in [1.0, 0.85, 0.7, 0.5]:
+      install runtime ablation hooks -> generate -> grade -> measure capability
+  -> sweep_result_<model>.json (pick the winning (layer, coefficient) by hand)
+            |
+            v
+run_full_pipeline(model, best_layer, best_coefficient)  (Modal, Blackwell B200)
+  baseline (no ablation): generate + grade + capability, across 12 eval categories
+  for each coefficient: runtime-ablate -> generate -> capability -> grade
+  permanent weight-level ablation at best_coefficient -> generate -> capability -> grade
+  -> results_<model>.json (refusal-by-category, capability, tradeoff curve)
+            |
+            v
+flagship_run(30B+ model)                    (Modal, Blackwell B200)
+  independent of the above, no eval sweep — confirms the technique still works
+  and reports peak GPU memory at flagship scale
+```
+
+**Key design decisions:**
+
+- **Per-layer directions, broadcast model-wide.** `compute_directions` computes a
+  distinct direction at every layer, but the actual technique picks *one* winning
+  layer's direction and removes that same vector from the residual stream at every
+  layer — not just its source layer (residual streams are additive, so a
+  single-layer edit can be reintroduced downstream).
+- **Two ablation methods, proven equivalent.** A reversible forward-hook
+  (`ablate_runtime.py`) and a permanent weight-level orthogonalization
+  (`ablate_weights.py`) are both implemented; `tests/test_ablate_weights.py` proves
+  they produce numerically identical output for a single layer, which is the basis
+  for trusting that the permanent edit reproduces what the reversible hook
+  demonstrated.
+- **Direction purification + signal-quality scoring.** `purify_direction`
+  Gram-Schmidt-orthogonalizes a computed direction against the harmless-prompt
+  direction, stripping out generic "a prompt was given at all" signal from the
+  true refusal-specific signal — motivated by an early finding that the raw
+  direction suppressed one prompt-phrasing style far more than another.
+  `layer_signal_quality` scores every layer's SNR/purity from the same activations
+  already extracted, as a free, cheap pre-filter before spending sweep GPU-time.
+- **Two-tier refusal grading.** A cheap rule-based pass classifies obvious
+  refusals/compliances; only genuinely ambiguous responses escalate to an
+  LLM-judge fallback (the model judging itself), keeping grading fast without
+  sacrificing accuracy on hard cases.
+- **Sweep grid is a fixed shortlist, not exhaustive.** Layer and coefficient
+  candidates are capped by construction (a handful of evenly-spaced layers × 4
+  coefficients) so sweep cost stays bounded regardless of model depth.
+
+## Requirements
+
+- **Python 3.11**
+- A [Modal](https://modal.com) account — all GPU compute runs on Modal-hosted
+  **NVIDIA Blackwell (B200)** GPUs, not locally; budgeted at roughly $30/month for
+  this project's scale
+- A [Hugging Face](https://huggingface.co) account + access token — some models and
+  datasets used here are gated
+- Package versions pinned in `requirements.txt`: `modal>=1.5.0`, `torch>=2.4.0`,
+  `transformers>=4.44.0`, `accelerate>=0.33.0`, `datasets>=2.20.0`,
+  `numpy>=1.26.0`, `pytest>=8.0.0`
 
 ## Quickstart
-
-### Prerequisites
-
-- Python 3.11
-- A [Modal](https://modal.com) account (compute runs on Modal's B200 GPUs, not locally)
-- A [Hugging Face](https://huggingface.co) account + access token (some models/datasets used here are gated)
-
-### Setup
 
 ```bash
 git clone <this-repo-url>
@@ -36,7 +114,7 @@ modal setup
 modal secret create huggingface-secret HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
 ```
 
-### Run
+## Usage
 
 ```bash
 # 1. Pull real AdvBench/Alpaca/ARC-Easy data onto the shared volume (CPU only)
@@ -44,16 +122,37 @@ modal run modal_app.py --stage prepare_data
 
 # 2. Extract the refusal direction for a model (first GPU spend)
 modal run modal_app.py --stage extract --model-name Qwen/Qwen2.5-7B-Instruct
+# ...or extract both raw and purified directions in one pass:
+modal run modal_app.py::extract_and_save_direction \
+    --model-name Qwen/Qwen2.5-7B-Instruct \
+    --output-name Qwen_Qwen2.5-7B-Instruct \
+    --purified
 
 # 3. Sweep layers/coefficients to find the best ablation operating point
 modal run modal_app.py::run_sweep --model-name Qwen/Qwen2.5-7B-Instruct \
     --directions-path /cache/directions_Qwen_Qwen2.5-7B-Instruct.pt
+
+# 4. Run the full pipeline at the sweep's winning (layer, coefficient)
+modal run modal_app.py::run_full_pipeline \
+    --model-name Qwen/Qwen2.5-7B-Instruct \
+    --best-layer 16 --best-coefficient 1.0
+
+# 5. Confirm the technique holds at 30B+ scale (no eval sweep, just a smoke check)
+modal run modal_app.py --stage flagship --model-name Qwen/Qwen2.5-32B-Instruct
+```
+
+Check cost, logs, or cached data without leaving the terminal:
+
+```bash
+modal app list                                     # recent runs
+modal app logs <app-id>                            # replay a run's full output
+modal volume ls abliteration-eval-cache            # inspect cached data/weights/results
 ```
 
 ## Results (Qwen2.5-7B-Instruct)
 
-All numbers below are post chat-template-fix (see `docs/03-bugs-and-fixes.md`, Bug
-#3) and reflect the current best-known operating point, not the first thing tried.
+All numbers below are post chat-template-fix and reflect the current best-known
+operating point, not the first thing tried.
 
 **Headline finding**: at **layer 16, coefficient 1.0**, permanent weight-level
 ablation drops refusal on a 292-prompt, 12-category eval set from a ~95-97%
@@ -95,6 +194,39 @@ over the model object, and `ablate_weights_` mutates that object in place, so th
 output). Directionally consistent with the runtime-hook variant's numbers, but
 treat the exact percentage-point figures as provisional until that's resolved.
 
+## Future initiatives
+
+- **Fix the weight-ablated self-judge bias** noted above — likely by judging with
+  a model snapshot captured before `ablate_weights_` mutates it in place, rather
+  than the same (already-ablated) model object.
+- **Norm-preserving weight ablation** — decompose each ablated weight row into
+  magnitude and direction, rescale back to original magnitude after removing the
+  refusal component, as a third capability-protection lever alongside the existing
+  coefficient blend.
+- **A generalized qualitative compare tool** — widen the current one-prompt debug
+  helper into a reusable side-by-side (baseline vs. ablated, across prompts,
+  coefficients, and ablation methods) rather than a bespoke script per question.
+- **Second-model repeat** — re-run the full pipeline (extract → sweep → full
+  pipeline) on Llama-3.1-8B-Instruct now that the chat-template fix is in place;
+  the existing Llama numbers predate that fix and are invalid.
+- **30B+ flagship confirmation run** — `flagship_run` exists but hasn't been
+  executed yet; confirms the technique and memory footprint hold at flagship scale.
+
+## Development & Testing
+
+```bash
+# Run the full unit test suite (pure PyTorch, CPU-only, no GPU/network required)
+python3.11 -m pytest tests/ -v
+
+# Syntax/import check without deploying
+python3.11 -m py_compile modal_app.py
+python3.11 -c "import modal_app"
+```
+
+39 unit tests, all pure `torch` on CPU — no GPU, no network, no HF access needed.
+No linter or build step is configured — this is a script/pipeline project, not a
+packaged library.
+
 ## Environment Variables
 
 This project uses **Modal Secrets**, not a `.env` file — nothing reads `os.environ` directly except `HF_HOME`, which the code sets itself for cache placement.
@@ -112,7 +244,8 @@ abliteration-eval/
 │                              # run_sweep, run_full_pipeline, flagship_run) + local_entrypoint
 ├── src/
 │   ├── model_utils.py        # Shared decoder-layer introspection, used by every stage below
-│   ├── extract_direction.py  # Activation extraction + per-layer direction computation
+│   ├── extract_direction.py  # Activation extraction + per-layer direction computation,
+│   │                          # direction purification, signal-quality scoring
 │   ├── layer_sweep.py        # Layer/coefficient sweep
 │   ├── ablate_runtime.py     # Reversible forward-hook ablation
 │   ├── ablate_weights.py     # Permanent weight-level ablation
@@ -129,39 +262,6 @@ abliteration-eval/
 └── requirements.txt
 ```
 
-## Usage
+## License
 
-Run the full pipeline for one model once you have a winning (layer, coefficient) from the sweep:
-
-```bash
-modal run modal_app.py::run_full_pipeline \
-    --model-name Qwen/Qwen2.5-7B-Instruct \
-    --best-layer 21 --best-coefficient 1.0
-```
-
-Confirm the technique holds at 30B+ scale (extraction + both ablation methods only, no eval sweep):
-
-```bash
-modal run modal_app.py --stage flagship --model-name Qwen/Qwen2.5-32B-Instruct
-```
-
-Check cost, logs, or cached data without leaving the terminal:
-
-```bash
-modal app list                                     # recent runs
-modal app logs <app-id>                            # replay a run's full output
-modal volume ls abliteration-eval-cache            # inspect cached data/weights/results
-```
-
-## Development & Testing
-
-```bash
-# Run the full unit test suite (pure PyTorch, CPU-only, no GPU/network required)
-python3.11 -m pytest tests/ -v
-
-# Syntax/import check without deploying
-python3.11 -m py_compile modal_app.py
-python3.11 -c "import modal_app"
-```
-
-No linter or build step is configured — this is a script/pipeline project, not a packaged library.
+[MIT](LICENSE)
