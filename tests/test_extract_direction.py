@@ -154,7 +154,7 @@ class _RecordingTokenizer:
     def __init__(self):
         self.calls: list[tuple[list[str], bool]] = []
 
-    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, enable_thinking):
         assert tokenize is False
         assert add_generation_prompt is True
         return f"<chat>{messages[0]['content']}</chat>"

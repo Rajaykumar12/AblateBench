@@ -7,9 +7,10 @@ prompt text instead of applying the model's chat template."""
 class _FakeTokenizerWithTemplate:
     chat_template = "some non-none template string"
 
-    def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+    def apply_chat_template(self, messages, tokenize, add_generation_prompt, enable_thinking):
         assert tokenize is False
         assert add_generation_prompt is True
+        assert enable_thinking is False
         assert messages == [{"role": "user", "content": "hello"}]
         return "<|template_wrapped|>hello<|assistant|>"
 
