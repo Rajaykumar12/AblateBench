@@ -97,6 +97,14 @@ def format_chat_prompt(tokenizer, prompt: str) -> str:
     Falls back to the raw prompt if the tokenizer has no chat template (e.g. a base
     model). Callers must tokenize the result with `add_special_tokens=False` - the
     template's output already contains BOS/header tokens.
+
+    `enable_thinking=False` puts hybrid-reasoning models (Qwen3 / Qwen3.5+, thinking
+    on by default) in direct-answer mode. With thinking on, the 128-token generation
+    budget is spent inside `<think>...</think>`, so the grader would score reasoning
+    text instead of the answer, and extraction's last-token activation would sit at
+    the start of a think block instead of where the model commits to a response.
+    Templates that don't reference the variable ignore it (Jinja drops unused
+    kwargs), so this is a no-op for Llama, Qwen2.5, Gemma.
     """
     if getattr(tokenizer, "chat_template", None) is None:
         return prompt
@@ -104,6 +112,7 @@ def format_chat_prompt(tokenizer, prompt: str) -> str:
         [{"role": "user", "content": prompt}],
         tokenize=False,
         add_generation_prompt=True,
+        enable_thinking=False,
     )
 
 
