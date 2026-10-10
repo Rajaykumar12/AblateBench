@@ -5,3 +5,6 @@ __pycache__/
 *.egg-info/
 .env
 docs/
+
+# graphify knowledge graph (local, rebuilt by git hooks)
+graphify-out/
