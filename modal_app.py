@@ -468,6 +468,95 @@ def run_full_pipeline(
     return results
 
 
+@app.function(image=image, gpu=DEFAULT_GPU, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
+def run_benchmarks(
+    model_name: str,
+    best_layer: int,
+    best_coefficient: float = 1.0,
+    directions_path: str | None = None,
+    mmlu_pro_questions: int = 500,
+    kl_prompts: int = 100,
+    result_suffix: str = "",
+):
+    """Harder capability checks than ARC-Easy (which saturates at 27B): MMLU-Pro
+    accuracy and KL(base || ablated) on harmless prompts, for the base model and the
+    same weight edit run_full_pipeline applies (sweep's layer broadcast model-wide).
+
+    Base and ablated are measured in one container - evaluate, edit in place,
+    evaluate again - so both see identical questions/prompts and the KL compares
+    distributions from the same forward-pass code path. The edit is in memory only;
+    nothing here writes or replaces a checkpoint."""
+    _add_src_to_path()
+    import os
+
+    os.environ["HF_HOME"] = HF_CACHE_DIR
+    import torch
+    from collections import defaultdict
+
+    from ablate_weights import ablate_weights_
+    from build_mmlu_pro_subset import build_and_save as build_mmlu_pro
+    from eval_capability import MCQuestion, score_questions
+    from eval_kl import first_token_log_probs, mean_kl_divergence
+
+    mmlu_path = f"{DATA_DIR}/mmlu_pro_subset_{mmlu_pro_questions}.json"
+    if not os.path.exists(mmlu_path):
+        build_mmlu_pro(mmlu_path, num_questions=mmlu_pro_questions)
+        volume.commit()
+    mmlu_rows = _load_json(mmlu_path)["questions"]
+    questions = [MCQuestion(r["question"], r["choices"], r["answer_index"]) for r in mmlu_rows]
+    categories = [r["category"] for r in mmlu_rows]
+    harmless = _load_json(f"{DATA_DIR}/harmless_prompts_heldout.json")[:kl_prompts]
+
+    model, tokenizer = _load_model_and_tokenizer(model_name)
+    tag = model_name.replace("/", "_")
+    directions_path = directions_path or f"{CACHE_DIR}/directions_{tag}.pt"
+    per_layer_directions = torch.load(directions_path, map_location="cuda")
+    directions = per_layer_directions[best_layer].unsqueeze(0).expand(
+        per_layer_directions.shape[0], -1
+    )
+
+    def mmlu_report(correct: list[bool]) -> dict:
+        per_cat = defaultdict(list)
+        for cat, ok in zip(categories, correct):
+            per_cat[cat].append(ok)
+        return {
+            "accuracy": sum(correct) / len(correct),
+            "by_category": {c: sum(v) / len(v) for c, v in sorted(per_cat.items())},
+        }
+
+    base_mmlu = mmlu_report(score_questions(model, tokenizer, questions, device="cuda"))
+    base_log_probs = first_token_log_probs(model, tokenizer, harmless, device="cuda")
+
+    ablate_weights_(model, directions, coefficient=best_coefficient)
+    ablated_mmlu = mmlu_report(score_questions(model, tokenizer, questions, device="cuda"))
+    ablated_log_probs = first_token_log_probs(model, tokenizer, harmless, device="cuda")
+
+    same_top1 = (base_log_probs.argmax(-1) == ablated_log_probs.argmax(-1)).float().mean().item()
+    results = {
+        "model": model_name,
+        "best_layer": best_layer,
+        "best_coefficient": best_coefficient,
+        "directions_path": directions_path,
+        "mmlu_pro": {
+            "num_questions": len(questions),
+            "chance_accuracy": sum(1 / len(q.choices) for q in questions) / len(questions),
+            "base": base_mmlu,
+            "ablated": ablated_mmlu,
+        },
+        "kl_harmless": {
+            "num_prompts": len(harmless),
+            "mean_kl_base_to_ablated_nats": mean_kl_divergence(base_log_probs, ablated_log_probs),
+            "first_token_top1_agreement": same_top1,
+        },
+    }
+    out_path = f"{CACHE_DIR}/benchmarks_{tag}{result_suffix}.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    volume.commit()
+    print(json.dumps(results, indent=2))
+    return results
+
+
 @app.function(
     image=image, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET],
     memory=16384,  # reshard holds one 5 GB output shard in RAM at a time
@@ -629,7 +718,7 @@ def main(
 ):
     """Convenience CLI: `modal run modal_app.py --stage <stage> [--gpu H100] ...`.
 
-    Stages: prepare_data | extract | sweep | full | flagship | push.
+    Stages: prepare_data | extract | sweep | full | benchmarks | flagship | push.
 
     `--gpu` overrides DEFAULT_GPU for this run only (any Modal GPU string: "L40S",
     "A100-80GB", "H100", "H200", "B200", "H100:2", ...). It's an entrypoint flag
@@ -664,6 +753,13 @@ def main(
         )
     elif stage == "flagship":
         on_gpu(flagship_run).remote(model_name, layer=best_layer if best_layer >= 0 else None)
+    elif stage == "benchmarks":
+        if best_layer < 0:
+            raise ValueError("--stage benchmarks needs --best-layer (the sweep's winner)")
+        on_gpu(run_benchmarks).remote(
+            model_name, best_layer, best_coefficient,
+            directions_path=directions_path, result_suffix=result_suffix,
+        )
     elif stage == "push":
         if not (checkpoint_path and repo_id):
             raise ValueError("--stage push needs --checkpoint-path and --repo-id")
