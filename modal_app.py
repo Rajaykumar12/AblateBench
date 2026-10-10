@@ -1,7 +1,8 @@
 """Modal orchestration for the abliteration-eval pipeline (PRD §7 "Modal specifics").
 
 Functions map 1:1 onto PRD pipeline stages and (with the exception of
-push_checkpoint_to_hub, pure I/O with no forward pass) all run with gpu="B200":
+push_checkpoint_to_hub, pure I/O with no forward pass) all run on DEFAULT_GPU (B200),
+overridable per run with `--gpu` on `main`:
   prepare_data()          -> stage [1]  (needs HF Hub network access - fine on Modal)
   extract_activations()   -> stages [2]+[3]
   run_sweep()              -> stage [4]
@@ -42,16 +43,28 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
         "torch>=2.4.0",
-        "transformers>=4.44.0",
+        "transformers>=5.19.0",  # qwen3_5 (Qwen3.5-3.8 hybrid) + Gemma 3 support
         "accelerate>=0.33.0",
         "datasets>=2.20.0",
         "numpy>=1.26.0",
+        # Triton kernels for Gated DeltaNet linear attention (Qwen3.5+ hybrids);
+        # without it transformers falls back to a much slower PyTorch reference.
+        "flash-linear-attention",
     )
     .add_local_dir("src", remote_path="/root/src")
     .add_local_dir("data", remote_path="/root/data")
 )
 
-B200_TIMEOUT_S = 60 * 60 * 2  # 2 hrs ceiling per PRD §12 cost table (~1-2 hrs typical)
+# 3 hr ceiling: ~1-2 hrs typical at 7-8B (PRD §12 cost table), but a 27-32B full
+# pipeline on an H100 plus a ~55 GB --save-checkpoint write can approach 2 hrs, and
+# a timeout there throws away the whole run. Only billed if actually used.
+GPU_TIMEOUT_S = 60 * 60 * 3
+
+# Default GPU baked into each decorator. Override per run with `--gpu` on the `main`
+# entrypoint (Function.with_options) - size it to the model: bf16 weights are ~2 GB
+# per 1B params, so 7-8B fits an L40S/A100-40GB, 27-32B needs an 80 GB card
+# (A100-80GB / H100), and B200 is only needed for 70B-class.
+DEFAULT_GPU = "B200"
 
 # walledai/AdvBench is a gated HF dataset, and Meta's Llama checkpoints (candidate
 # "second model", PRD §7) are gated too - both need an authenticated HF_TOKEN, which
@@ -67,7 +80,7 @@ def _add_src_to_path():
     sys.path.insert(0, "/root/data")
 
 
-@app.function(image=image, volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
+@app.function(image=image, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
 def prepare_data(num_harmful: int = 300, num_harmless: int = 300, num_capability_q: int = 100):
     """Stage [1]: download and split the harmful/harmless prompt sets, and build the
     capability-eval subset. Runs on a CPU container (no GPU needed) since this is
@@ -119,8 +132,22 @@ def _save_checkpoint(model, tokenizer, path: str) -> None:
     import os
 
     os.makedirs(path, exist_ok=True)
-    model.save_pretrained(path, safe_serialization=True)
+    # 5 GB shards: the HF Hub rejects files over 50 GB, and the default here wrote a
+    # single 46 GiB shard for a 27B model.
+    model.save_pretrained(path, safe_serialization=True, max_shard_size="5GB")
     tokenizer.save_pretrained(path)
+    # Multimodal checkpoints (Gemma 3) also need their image processor config, or
+    # the saved model can't be loaded back for image input. Gated on vision_config
+    # so text-only models never touch AutoProcessor, and non-fatal because this runs
+    # at the tail of a long GPU run - the text checkpoint above is already complete,
+    # and the processor files can be copied from the base repo later if missing.
+    if getattr(model.config, "vision_config", None) is not None:
+        from transformers import AutoProcessor
+
+        try:
+            AutoProcessor.from_pretrained(model.name_or_path).save_pretrained(path)
+        except OSError as e:
+            print(f"WARNING: checkpoint saved without image processor files: {e}")
 
 
 def _format_chat(tokenizer, prompt: str) -> str:
@@ -162,7 +189,7 @@ def _make_self_judge(model, tokenizer):
     return judge_fn
 
 
-@app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
+@app.function(image=image, gpu=DEFAULT_GPU, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
 def extract_and_save_direction(model_name: str, output_name: str, purified: bool = False):
     """Stages [2]+[3] for one model: extract activations on the train splits, compute
     per-layer directions, save to the volume for reuse by run_sweep / ablation stages
@@ -213,7 +240,7 @@ def extract_and_save_direction(model_name: str, output_name: str, purified: bool
     return out_path, purified_out_path
 
 
-@app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
+@app.function(image=image, gpu=DEFAULT_GPU, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
 def run_sweep(
     model_name: str,
     directions_path: str,
@@ -298,7 +325,7 @@ def _generate(model, tokenizer, prompts: list[str], max_new_tokens: int = 128) -
     return responses
 
 
-@app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
+@app.function(image=image, gpu=DEFAULT_GPU, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
 def run_full_pipeline(
     model_name: str,
     best_layer: int,
@@ -419,6 +446,18 @@ def run_full_pipeline(
         "tradeoff_curve": curve.as_table_rows(),
         "judge_fallback_rate_baseline": baseline_refusal.judge_fallback_rate,
         "checkpoints_saved": checkpoints_saved,
+        # A refusal rate near 0 can't distinguish "answers the question" from
+        # "degenerate text the grader doesn't recognize as a refusal" - keep a few
+        # raw generations per category so coherence can actually be read.
+        "sample_responses": {
+            c: [
+                {"prompt": p, "baseline": b, "weight_ablated": w}
+                for p, b, w in zip(
+                    category_prompts[c][:2], baseline_responses[c][:2], weight_responses[c][:2]
+                )
+            ]
+            for c in category_prompts
+        },
     }
 
     out_path = f"{CACHE_DIR}/results_{tag}{result_suffix}.json"
@@ -429,14 +468,22 @@ def run_full_pipeline(
     return results
 
 
-@app.function(image=image, volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
+@app.function(
+    image=image, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET],
+    memory=16384,  # reshard holds one 5 GB output shard in RAM at a time
+)
 def push_checkpoint_to_hub(checkpoint_path: str, repo_id: str, private: bool = True):
     """Decoupled publish step, invoked directly (`modal run
     modal_app.py::push_checkpoint_to_hub --checkpoint-path ... --repo-id ...`), not
     called from run_full_pipeline - saving a checkpoint and publishing it are
     separate decisions the user makes at separate times (PRD/docs/08). No `gpu=`:
-    this only re-serializes an already-ablated checkpoint already on the volume and
-    uploads it, no forward pass needed, so it shouldn't cost GPU time.
+    this only uploads an already-ablated checkpoint already on the volume, no forward
+    pass needed, so it shouldn't cost GPU time.
+
+    Uploads the checkpoint folder's files as-is (they're already safetensors written
+    by _save_checkpoint) rather than reloading the model just to push it again - a
+    reload would need the full model in container RAM (~55 GB for 27B, double that if
+    it falls back to fp32), for no change to the bytes uploaded.
 
     Requires `huggingface-secret`'s HF_TOKEN to have *write* scope - the token this
     project has been using so far was only ever needed for reading gated datasets/
@@ -444,18 +491,32 @@ def push_checkpoint_to_hub(checkpoint_path: str, repo_id: str, private: bool = T
     https://huggingface.co/settings/tokens before calling this:
         modal secret create huggingface-secret HF_TOKEN=<write-scoped-token> --force
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    _add_src_to_path()
+    from huggingface_hub import HfApi
 
-    model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
-    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
-    model.push_to_hub(repo_id, private=private)
-    tokenizer.push_to_hub(repo_id, private=private)
+    from checkpoint_utils import reshard_safetensors
+
+    # Checkpoints saved before _save_checkpoint capped shard size can hold a single
+    # ~50 GB shard - at the Hub's per-file limit. Streamed rewrite, no full-model RAM.
+    if reshard_safetensors(checkpoint_path):
+        volume.commit()
+        print(f"Resharded {checkpoint_path} into <=5 GB shards")
+
+    api = HfApi()
+    api.create_repo(repo_id, repo_type="model", private=private, exist_ok=True)
+    # huggingface_hub 2.x removed upload_large_folder; upload_folder now streams
+    # large files through Xet itself. Ignore patterns skip any reshard/temp leftovers.
+    api.upload_folder(
+        repo_id=repo_id, folder_path=checkpoint_path, repo_type="model",
+        commit_message="Upload abliterated checkpoint",
+        ignore_patterns=[".tmp*", "reshard-tmp-*", ".cache/*"],
+    )
     repo_url = f"https://huggingface.co/{repo_id}"
     print(f"Pushed checkpoint to {repo_url}")
     return repo_url
 
 
-@app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
+@app.function(image=image, gpu=DEFAULT_GPU, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
 def debug_ablation_effect(model_name: str, best_layer: int, prompt: str | None = None):
     """Diagnostic (not a pipeline stage): prints the actual generated text at several
     ablation coefficients side by side, for one prompt. Exists to answer a concrete
@@ -488,7 +549,7 @@ def debug_ablation_effect(model_name: str, best_layer: int, prompt: str | None =
         print(f"--- coefficient={coeff} ---\n{response}\n")
 
 
-@app.function(image=image, gpu="B200", volumes={CACHE_DIR: volume}, timeout=B200_TIMEOUT_S, secrets=[HF_SECRET])
+@app.function(image=image, gpu=DEFAULT_GPU, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
 def flagship_run(model_name: str, layer: int | None = None, coefficient: float = 1.0):
     """30B+ flagship confirmation: extraction + both ablation methods only, no eval
     sweep (PRD "Flagship confirmation run"). Reports peak HBM usage relative to a
@@ -552,16 +613,60 @@ def flagship_run(model_name: str, layer: int | None = None, coefficient: float =
 
 
 @app.local_entrypoint()
-def main(stage: str = "prepare_data", model_name: str = "Qwen/Qwen2.5-7B-Instruct"):
-    """Convenience CLI: `modal run modal_app.py --stage prepare_data`."""
+def main(
+    stage: str = "prepare_data",
+    model_name: str = "Qwen/Qwen2.5-7B-Instruct",
+    gpu: str = "",
+    purified: bool = False,
+    layer_shortlist: str = "",
+    best_layer: int = -1,
+    best_coefficient: float = 1.0,
+    result_suffix: str = "",
+    save_checkpoint: bool = False,
+    checkpoint_path: str = "",
+    repo_id: str = "",
+    private: bool = True,
+):
+    """Convenience CLI: `modal run modal_app.py --stage <stage> [--gpu H100] ...`.
+
+    Stages: prepare_data | extract | sweep | full | flagship | push.
+
+    `--gpu` overrides DEFAULT_GPU for this run only (any Modal GPU string: "L40S",
+    "A100-80GB", "H100", "H200", "B200", "H100:2", ...). It's an entrypoint flag
+    rather than a parameter on each function because Modal fixes a function's GPU in
+    its decorator; Function.with_options is the supported per-call override.
+
+    `--purified` makes sweep/full use directions_purified_{tag}.pt (extract with
+    --purified writes both raw and purified files).
+    """
+    tag = model_name.replace("/", "_")
+    directions_path = f"{CACHE_DIR}/directions_{'purified_' if purified else ''}{tag}.pt"
+
+    def on_gpu(fn):
+        return fn.with_options(gpu=gpu) if gpu else fn
+
     if stage == "prepare_data":
         prepare_data.remote()
     elif stage == "extract":
-        extract_and_save_direction.remote(model_name, model_name.replace("/", "_"))
+        on_gpu(extract_and_save_direction).remote(model_name, tag, purified=purified)
     elif stage == "sweep":
-        directions_path = f"{CACHE_DIR}/directions_{model_name.replace('/', '_')}.pt"
-        run_sweep.remote(model_name, directions_path)
+        on_gpu(run_sweep).remote(
+            model_name, directions_path,
+            layer_shortlist=layer_shortlist or None, result_suffix=result_suffix,
+        )
+    elif stage == "full":
+        if best_layer < 0:
+            raise ValueError("--stage full needs --best-layer (the sweep's winner)")
+        on_gpu(run_full_pipeline).remote(
+            model_name, best_layer, best_coefficient,
+            directions_path=directions_path, result_suffix=result_suffix,
+            save_checkpoint=save_checkpoint,
+        )
     elif stage == "flagship":
-        flagship_run.remote(model_name)
+        on_gpu(flagship_run).remote(model_name, layer=best_layer if best_layer >= 0 else None)
+    elif stage == "push":
+        if not (checkpoint_path and repo_id):
+            raise ValueError("--stage push needs --checkpoint-path and --repo-id")
+        push_checkpoint_to_hub.remote(checkpoint_path, repo_id, private=private)
     else:
         raise ValueError(f"Unknown stage: {stage}")
