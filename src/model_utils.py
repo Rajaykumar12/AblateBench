@@ -12,17 +12,44 @@ import torch.nn as nn
 
 # Attribute paths where common causal-LM architectures (Llama, Qwen2, Mistral, Gemma,
 # ...) keep their stack of decoder layers. Extend this list if a future model doesn't
-# match any of these.
-_DECODER_LAYER_PATHS = ("model.layers", "transformer.h", "gpt_neox.layers")
+# match any of these. `model.language_model.layers` is Gemma 3's multimodal wrapper
+# (Gemma3ForConditionalGeneration, what AutoModelForCausalLM returns for
+# google/gemma-3-27b-it) - its text decoder sits one level deeper than usual.
+_DECODER_LAYER_PATHS = (
+    "model.layers",
+    "transformer.h",
+    "gpt_neox.layers",
+    "model.language_model.layers",
+)
 
 # Sub-module names, relative to each decoder layer, whose output is written directly
 # into the residual stream and is therefore a valid target for weight-level ablation.
 # (embed_tokens also writes into the stream at layer 0; PRD scopes weight-level
 # ablation to "each layer's output projection", so it's deliberately excluded here.)
+#
+# `linear_attn.out_proj`: hybrid models (Qwen3.5 / 3.6 / 3.8) use Gated DeltaNet linear
+# attention in 3 of every 4 layers, which writes to the stream through `out_proj`
+# instead of `self_attn.o_proj`. Without it those layers would silently get an
+# MLP-only edit, since down_proj alone is enough to pass the "found something" check.
 _RESIDUAL_WRITE_PROJECTIONS = (
     "self_attn.o_proj",
+    "linear_attn.out_proj",
     "mlp.down_proj",
 )
+
+# "Sandwich-norm" architectures (Gemma 2, Gemma 3) apply an RMSNorm to each
+# sub-block's output *before* the residual add, so the projection is not the last
+# thing to touch what gets written into the stream. Maps each residual-write
+# projection to the norm that follows it in those architectures.
+_POST_NORM_FOR_PROJECTION = {
+    "self_attn.o_proj": "post_attention_layernorm",
+    "linear_attn.out_proj": "post_attention_layernorm",
+    "mlp.down_proj": "post_feedforward_layernorm",
+}
+# Marker for a sandwich-norm layer. NOT `post_attention_layernorm` alone: Llama/Qwen
+# also have a module by that name, but there it's the *pre*-MLP norm and reads from
+# the stream rather than sitting between o_proj and the residual add.
+_SANDWICH_NORM_MARKER = "post_feedforward_layernorm"
 
 
 def get_decoder_layers(model: nn.Module) -> list[nn.Module]:
@@ -51,21 +78,35 @@ def get_decoder_layers(model: nn.Module) -> list[nn.Module]:
 def get_residual_write_modules(layer: nn.Module) -> list[nn.Linear]:
     """Return the Linear sub-modules of one decoder layer whose output feeds directly
     into the residual stream (attention output projection, MLP down projection)."""
-    modules = []
+    return [proj for proj, _ in get_residual_write_modules_with_post_norms(layer)]
+
+
+def get_residual_write_modules_with_post_norms(
+    layer: nn.Module,
+) -> list[tuple[nn.Linear, nn.Module | None]]:
+    """Like get_residual_write_modules, but pairs each projection with the norm that
+    sits between it and the residual add (Gemma 2/3 sandwich norms), or None for
+    pre-norm architectures (Llama, Qwen, Mistral) where the projection writes into
+    the stream directly. ablate_weights needs this: with a post-norm in between,
+    orthogonalizing the projection against d_hat alone doesn't stop the norm's
+    per-channel scale from reintroducing a d_hat component."""
+    sandwich = hasattr(layer, _SANDWICH_NORM_MARKER)
+    pairs = []
     for dotted_name in _RESIDUAL_WRITE_PROJECTIONS:
         obj = layer
         try:
             for part in dotted_name.split("."):
                 obj = getattr(obj, part)
-            modules.append(obj)
         except AttributeError:
             continue
-    if not modules:
+        post_norm = getattr(layer, _POST_NORM_FOR_PROJECTION[dotted_name]) if sandwich else None
+        pairs.append((obj, post_norm))
+    if not pairs:
         raise ValueError(
             f"Could not locate any residual-write projections on layer "
             f"{type(layer).__name__}; tried: {_RESIDUAL_WRITE_PROJECTIONS}"
         )
-    return modules
+    return pairs
 
 
 def unwrap_hidden_state(output) -> torch.Tensor:

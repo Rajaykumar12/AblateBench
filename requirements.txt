@@ -2,7 +2,7 @@
 # for local, CPU-only unit tests (torch is CPU-only locally; Modal installs a CUDA build).
 modal>=1.5.0
 torch>=2.4.0
-transformers>=4.44.0
+transformers>=5.19.0
 accelerate>=0.33.0
 datasets>=2.20.0
 numpy>=1.26.0
