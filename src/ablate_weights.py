@@ -18,13 +18,40 @@ means that layer can no longer inject any component along d_hat into the stream,
 regardless of input — a stronger and more direct claim than "empirically, refusal
 rate drops," and the reason ablate_weights must reproduce ablate_runtime's
 refusal-rate drop with the hook removed (PRD §5, row 4).
+
+Sandwich-norm models (Gemma 2/3) put an RMSNorm between each projection and the
+residual add, so there the projection is orthogonalized against a norm-adjusted
+direction instead - see post_norm_adjusted_direction.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from model_utils import get_decoder_layers, get_residual_write_modules
+from model_utils import get_decoder_layers, get_residual_write_modules_with_post_norms
+
+
+def post_norm_adjusted_direction(post_norm: nn.Module, d_hat: torch.Tensor) -> torch.Tensor:
+    """Direction to orthogonalize a projection against when an RMSNorm sits between
+    it and the residual add (Gemma 2/3 sandwich norms).
+
+    That norm computes `g * z / rms(z)` with a learned per-channel scale `g`, so the
+    stream sees `d_hat . (g * z) / rms(z) = (g * d_hat) . z / rms(z)`. The scalar
+    1/rms(z) can't create a d_hat component, so zeroing it for every input requires
+    the projection's output z to be orthogonal to `u = normalize(g * d_hat)` - *not*
+    to d_hat itself, which the norm would rescale channel-wise straight back into a
+    d_hat component.
+
+    `g` is read by probing the norm with an all-ones vector (rms(1) = 1, up to eps)
+    rather than from its `.weight`, so this doesn't depend on how a given
+    architecture parameterizes the scale (Gemma stores it as `1 + weight`)."""
+    hidden_dim = d_hat.shape[0]
+    param = next(post_norm.parameters())
+    ones = torch.ones(1, hidden_dim, dtype=torch.float32, device=param.device)
+    g = post_norm(ones).float().squeeze(0)
+    u = g * d_hat.to(device=g.device, dtype=torch.float32)
+    norm = u.norm()
+    return u / norm if norm > 0 else u
 
 
 def orthogonalize_matrix(weight: torch.Tensor, d_hat: torch.Tensor) -> torch.Tensor:
@@ -66,11 +93,12 @@ def ablate_weights_(
         d_hat = directions[idx]
         if torch.count_nonzero(d_hat) == 0:
             continue  # degenerate layer (see extract_direction.compute_directions)
-        for proj in get_residual_write_modules(layers[idx]):
-            new_weight = orthogonalize_matrix(proj.weight.data, d_hat)
+        for proj, post_norm in get_residual_write_modules_with_post_norms(layers[idx]):
+            target = d_hat if post_norm is None else post_norm_adjusted_direction(post_norm, d_hat)
+            new_weight = orthogonalize_matrix(proj.weight.data, target)
             proj.weight.data = (
                 (1 - coefficient) * proj.weight.data + coefficient * new_weight
             )
             if proj.bias is not None:
-                new_bias = orthogonalize_bias(proj.bias.data, d_hat)
+                new_bias = orthogonalize_bias(proj.bias.data, target)
                 proj.bias.data = (1 - coefficient) * proj.bias.data + coefficient * new_bias
