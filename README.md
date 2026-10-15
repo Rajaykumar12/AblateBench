@@ -147,8 +147,31 @@ Hybrid linear/full-attention model (48 Gated DeltaNet + 16 full-attention layers
 3. **`run_sweep`** (B200) — broadcasts each candidate layer's direction model-wide, tests it across coefficients, grades refusal + capability.
 4. **`run_full_pipeline`** (B200) — runs baseline, runtime-hook ablation, and permanent weight ablation at the sweep's winning operating point; outputs the refusal/capability tradeoff curve.
 5. **`run_benchmarks`** (GPU) — MMLU-Pro accuracy and harmless-prompt KL divergence for the base model and the same weight edit, in one container.
-6. **`flagship_run`** (B200) — independent smoke test confirming the technique and memory footprint hold at 30B+ scale.
-7. **`push_checkpoint_to_hub`** (CPU) — reshards any checkpoint shard over 5 GB (streaming, no full-model RAM), then uploads the folder as-is.
+6. **`compare_models`** (B200) — evaluation-only comparison of two *separately published* checkpoints (an unabliterated baseline and an already-abliterated model). Loads each sequentially and runs the same battery: per-category refusal rate, MMLU-Pro, three defensive-security scorers (security MCQ, vulnerability detection, patch synthesis), and cross-model KL on harmless prompts. No training, no exploit generation.
+7. **`flagship_run`** (B200) — independent smoke test confirming the technique and memory footprint hold at 30B+ scale.
+8. **`push_checkpoint_to_hub`** (CPU) — reshards any checkpoint shard over 5 GB (streaming, no full-model RAM), then uploads the folder as-is.
+
+Run the comparison with:
+
+```bash
+modal run modal_app.py --stage compare \
+  --baseline-id Qwen/Qwen3.8-27B \
+  --abliterated-id rajaykumar12959/qwen3.8-27b-abliterated
+```
+
+Add `--judge-id <hf-repo>` to grade refusals and patches with **one fixed external
+judge** applied identically to both models, instead of each model judging its own
+outputs. This removes the self-judge bias; prefer a smaller judge (e.g. a 7–8B
+instruct model) so it fits next to the 27B under test:
+
+```bash
+modal run modal_app.py --stage compare \
+  --baseline-id Qwen/Qwen3.8-27B \
+  --abliterated-id rajaykumar12959/qwen3.8-27b-abliterated \
+  --judge-id Qwen/Qwen2.5-7B-Instruct
+```
+
+Refusal and patch grading use each model's own self-judge (a known bias — the abliterated model's refusal rate is a lower bound relative to a fixed external judge — recorded in the result's `caveat` field). The three defensive datasets are built on first use: security MCQ from the **CyberMetric** mirror (`RISys-Lab/Benchmarks_CyberSec_CyberMetrics`, with a ~30-question curated fallback if it can't be loaded or parsed), vulnerability detection from **CodeXGLUE defect-detection** (`google/code_x_glue_cc_defect_detection`, binary vulnerable/safe, static fallback otherwise), and **patch synthesis** from a curated set of short, specifically-described canonical vulnerabilities (buffer overflow, SQLi, SSRF, XSS, insecure deserialization, …) — CodeXGLUE is deliberately not used for patching, since its long, description-less funcs give the model nothing concrete to fix.
 
 **Design decisions:**
 
@@ -163,7 +186,6 @@ Hybrid linear/full-attention model (48 Gated DeltaNet + 16 full-attention layers
 
 - Fix the weight-ablated self-judge bias by judging against a pre-mutation model snapshot.
 - Implement norm-preserving weight ablation to protect model capability, and test whether it (or a gentler coefficient like 0.7) recovers Qwen3.8-27B's 3.3pp MMLU-Pro drop.
-- Build a general baseline-vs-ablated qualitative compare tool.
 - Re-run the full pipeline on Llama-3.1-8B-Instruct post chat-template-fix.
 - Add serving/inference for a saved checkpoint (deferred; preferred design is a bearer-token-gated endpoint).
 
