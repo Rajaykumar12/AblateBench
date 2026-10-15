@@ -5,3 +5,7 @@ from pathlib import Path
 # without needing an installed package — matches how modal_app.py will import them
 # too (mounted alongside the entrypoint on the Modal container).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+# Also make data/ builders importable as top-level modules (build_defensive_subset,
+# build_mmlu_pro_subset, ...) - matches modal_app mounting data/ at /root/data.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "data"))
