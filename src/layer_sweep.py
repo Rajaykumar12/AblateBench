@@ -28,6 +28,7 @@ class SweepCandidate:
     coefficient: float
     refusal_rate: float
     capability_score: float
+    band: str | None = None  # "start-end" for a per-layer band candidate
 
 
 @dataclass
@@ -47,13 +48,74 @@ class SweepResult:
     def as_table_rows(self) -> list[dict]:
         return [
             {
-                "layer": c.layer_index,
+                "layer": c.layer_index if c.band is None else f"band:{c.band}",
                 "coefficient": c.coefficient,
                 "refusal_rate": c.refusal_rate,
                 "capability_score": c.capability_score,
             }
             for c in self.candidates
         ]
+
+
+def parse_band(band: str) -> tuple[int, int]:
+    """'24-35' -> (24, 35), inclusive on both ends."""
+    start, end = (int(x) for x in band.split("-"))
+    if start > end:
+        raise ValueError(f"band start {start} is after end {end}")
+    return start, end
+
+
+def band_directions(directions: torch.Tensor, band: str) -> torch.Tensor:
+    """Each layer inside `band` keeps its *own* direction; every other layer gets the
+    zero vector, which install_ablation_hooks' callers and ablate_weights_ treat as
+    "leave this layer alone". The alternative to broadcasting one layer's direction
+    model-wide: only layers with a strong refusal signal are touched, each with the
+    direction measured there."""
+    start, end = parse_band(band)
+    if not 0 <= start <= end < directions.shape[0]:
+        raise ValueError(f"band {band} outside 0-{directions.shape[0] - 1}")
+    out = torch.zeros_like(directions)
+    out[start : end + 1] = directions[start : end + 1]
+    return out
+
+
+def run_band_sweep(
+    model: nn.Module,
+    directions: torch.Tensor,
+    bands: list[str],
+    measure_refusal_rate: Callable[[], object],
+    measure_capability: Callable[[], float],
+    coefficient_shortlist: list[float] | None = None,
+    grade_refusal: Callable[[object], float] | None = None,
+) -> SweepResult:
+    """Per-layer band candidates, scored exactly like run_ablation_sweep's (same
+    callbacks, grading after the hooks are removed) so the rows are comparable."""
+    coefficient_shortlist = coefficient_shortlist or DEFAULT_COEFFICIENT_SHORTLIST
+    candidates = []
+    for band in bands:
+        start, end = parse_band(band)
+        per_layer = band_directions(directions, band)
+        for coeff in coefficient_shortlist:
+            handles = install_ablation_hooks(
+                model, per_layer, coefficient=coeff, layer_indices=list(range(start, end + 1))
+            )
+            try:
+                refusal_rate = measure_refusal_rate()
+                capability_score = measure_capability()
+            finally:
+                remove_hooks(handles)
+            if grade_refusal is not None:
+                refusal_rate = grade_refusal(refusal_rate)
+            candidates.append(
+                SweepCandidate(
+                    layer_index=start,
+                    coefficient=coeff,
+                    refusal_rate=refusal_rate,
+                    capability_score=capability_score,
+                    band=band,
+                )
+            )
+    return SweepResult(candidates=candidates)
 
 
 def default_layer_shortlist(num_layers: int, num_candidates: int = 6) -> list[int]:
@@ -77,6 +139,7 @@ def run_ablation_sweep(
     measure_capability: Callable[[], float],
     layer_shortlist: list[int] | None = None,
     coefficient_shortlist: list[float] | None = None,
+    grade_refusal: Callable[[object], float] | None = None,
 ) -> SweepResult:
     """Drive the sweep. For each candidate layer, its per-layer direction is treated
     as *the* refusal direction and projected out of **every** decoder layer's output
@@ -94,6 +157,11 @@ def run_ablation_sweep(
     here) avoids coupling the sweep to a specific prompt set or tokenizer setup, which
     differs between the validation slice used here and the full held-out eval run in
     stage [7]/[8].
+
+    `grade_refusal`: when given, `measure_refusal_rate` returns raw generations
+    (produced with hooks installed) and `grade_refusal(generations)` turns them into a
+    rate *after* the hooks are removed - so a model-based judge grades with the clean
+    model rather than the ablated one, which otherwise mislabels its own outputs.
     """
     num_layers = directions.shape[0]
     layer_shortlist = layer_shortlist or default_layer_shortlist(num_layers)
@@ -113,6 +181,8 @@ def run_ablation_sweep(
                 capability_score = measure_capability()
             finally:
                 remove_hooks(handles)
+            if grade_refusal is not None:
+                refusal_rate = grade_refusal(refusal_rate)
             candidates.append(
                 SweepCandidate(
                     layer_index=layer_idx,
