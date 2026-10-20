@@ -103,18 +103,108 @@ def _load_model_and_tokenizer(model_name: str, device: str = "cuda"):
     import os
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     os.environ["HF_HOME"] = HF_CACHE_DIR
+    config = AutoConfig.from_pretrained(model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"  # correct for causal-LM batched generation
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.bfloat16, device_map=device
-    )
+    load_kwargs = dict(dtype=torch.bfloat16, device_map=device)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    except ValueError as causal_error:
+        # Qwen3.5 checkpoints advertise a conditional-generation class rather
+        # than a causal-LM class, despite exposing the same logits API. Do not
+        # apply this fallback to text-only models such as Qwen2.5: doing so
+        # hides the useful causal-loader error behind an unrelated multimodal
+        # configuration error.
+        conditional_model_types = {"qwen3_5", "qwen3_5_moe"}
+        if getattr(config, "model_type", None) not in conditional_model_types:
+            raise RuntimeError(
+                f"Could not load {model_name!r} as a causal language model: "
+                f"{causal_error}"
+            ) from causal_error
+        try:
+            from transformers import AutoModelForImageTextToText
+
+            model = AutoModelForImageTextToText.from_pretrained(model_name, **load_kwargs)
+        except (ImportError, KeyError, RuntimeError, ValueError) as multimodal_error:
+            raise RuntimeError(
+                f"Could not load conditional-generation model {model_name!r}. "
+                f"Causal loader error: {causal_error}; "
+                f"conditional loader error: {multimodal_error}"
+            ) from multimodal_error
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower() or "cuda" in str(exc).lower():
+            raise RuntimeError(
+                f"CUDA memory was insufficient while loading {model_name!r}. "
+                "Use a larger/multi-GPU Modal shape or omit the external judge."
+            ) from exc
+        raise
     model.eval()
     return model, tokenizer
+
+
+@app.function(
+    image=image,
+    gpu=DEFAULT_GPU,
+    volumes={CACHE_DIR: volume},
+    timeout=GPU_TIMEOUT_S,
+    secrets=[HF_SECRET],
+)
+def inspect_model(model_name: str):
+    """Load a checkpoint and report its decoder/expert projection layout.
+
+    This is a non-mutating MoE compatibility probe. It deliberately does not
+    run ablation or save weights; use its output to choose the GPU and validate
+    the subsequent full run.
+    """
+    _add_src_to_path()
+    import os
+    import torch
+
+    os.environ["HF_HOME"] = HF_CACHE_DIR
+    from model_utils import get_decoder_layers, get_residual_write_modules_with_post_norms
+
+    model, tokenizer = _load_model_and_tokenizer(model_name)
+    layers = get_decoder_layers(model)
+    projections = []
+    for layer_index, layer in enumerate(layers):
+        for projection, post_norm in get_residual_write_modules_with_post_norms(layer):
+            if isinstance(projection, torch.nn.Parameter):
+                shape = tuple(projection.shape)
+                name = "packed_parameter"
+            else:
+                shape = tuple(projection.weight.shape)
+                name = type(projection).__name__
+            projections.append(
+                {
+                    "layer": layer_index,
+                    "module": name,
+                    "shape": shape,
+                    "dim": len(shape),
+                    "post_norm": type(post_norm).__name__ if post_norm is not None else None,
+                }
+            )
+
+    summary = {
+        "model": model_name,
+        "model_class": type(model).__name__,
+        "tokenizer_class": type(tokenizer).__name__,
+        "num_parameters": sum(p.numel() for p in model.parameters()),
+        "num_layers": len(layers),
+        "projection_count": len(projections),
+        "three_dimensional_projections": sum(p["dim"] == 3 for p in projections),
+        "projections": projections,
+    }
+    path = f"{CACHE_DIR}/inspection_{model_name.replace('/', '_')}.json"
+    with open(path, "w") as handle:
+        json.dump(summary, handle, indent=2)
+    volume.commit()
+    print(json.dumps(summary, indent=2))
+    return summary
 
 
 def _load_json(path: str):
@@ -129,9 +219,18 @@ def _save_checkpoint(model, tokenizer, path: str) -> None:
     no dependency on this repo, at the cost of duplicating the full checkpoint on disk
     per save (accepted: `save_checkpoint=False` by default keeps eval-only runs free
     of this cost)."""
+    import gc
     import os
 
+    import torch
+
     os.makedirs(path, exist_ok=True)
+    # Serialize from CPU: transformers 5 un-fuses MoE expert tensors on save
+    # (revert_weight_conversion), materializing per-expert copies on the weights'
+    # device - an extra tens of GB that OOM'd an 80 GB card holding a 35B MoE.
+    model.to("cpu")
+    gc.collect()
+    torch.cuda.empty_cache()
     # 5 GB shards: the HF Hub rejects files over 50 GB, and the default here wrote a
     # single 46 GiB shard for a 27B model.
     model.save_pretrained(path, safe_serialization=True, max_shard_size="5GB")
@@ -187,6 +286,16 @@ def _make_self_judge(model, tokenizer):
         return "refuse" if "REFUSE" in gen else "comply"
 
     return judge_fn
+
+
+def _make_external_judge(judge_id: str):
+    """Load one frozen judge model for all ablation candidates in a run."""
+    judge_model, judge_tokenizer = _load_model_and_tokenizer(judge_id)
+    return (
+        _make_self_judge(judge_model, judge_tokenizer),
+        judge_model,
+        judge_tokenizer,
+    )
 
 
 def _make_patch_fix_judge(model, tokenizer):
@@ -280,14 +389,15 @@ def run_sweep(
     directions_path: str,
     layer_shortlist: str | None = None,
     result_suffix: str = "",
+    coefficient_shortlist: str | None = None,
+    bands: str | None = None,
 ):
     """Stage [4]: layer/coefficient sweep on the held-out validation slice.
 
-    Note: the judge call inside measure_refusal_rate runs while that candidate's
-    ablation hooks are still installed (it's inside run_ablation_sweep's hooked
-    window) - acceptable for candidate *selection*, since the sweep only needs a
-    relative ranking, not a publishable number. run_full_pipeline (the actually
-    reported numbers) removes hooks before judging - see its comment below.
+    Generations run under each candidate's hooks; the judge grades them after the
+    hooks are removed (run_ablation_sweep's `grade_refusal`), so the clean model
+    judges. Judging under the hooks let the ablated model grade itself, which skewed
+    the ranking on Qwen3.5-35B-A3B.
 
     `layer_shortlist`: optional comma-separated layer indices (e.g. "21,22,23,27") to
     override layer_sweep.default_layer_shortlist's evenly-spaced picks — useful when
@@ -296,13 +406,19 @@ def run_sweep(
     behavior: even spacing).
     `result_suffix`: appended to the output filename so a targeted re-sweep doesn't
     overwrite the default sweep's result file.
+    `coefficient_shortlist`: optional comma-separated coefficients (e.g. "1.0") to
+    override DEFAULT_COEFFICIENT_SHORTLIST - a dense layer sweep at full strength
+    costs a quarter of the default 4-coefficient grid.
+    `bands`: optional comma-separated layer bands (e.g. "24-35,28-35"). When set,
+    sweeps per-layer band candidates (each layer in the band ablates its own
+    direction) instead of broadcasting single-layer directions.
     """
     _add_src_to_path()
     import torch
 
     from eval_capability import MCQuestion, evaluate_capability
-    from eval_refusal import evaluate_refusal_by_category, grade_rule_based
-    from layer_sweep import run_ablation_sweep
+    from eval_refusal import evaluate_refusal_by_category
+    from layer_sweep import run_ablation_sweep, run_band_sweep
 
     model, tokenizer = _load_model_and_tokenizer(model_name)
     directions = torch.load(directions_path, map_location="cuda")
@@ -315,19 +431,36 @@ def run_sweep(
     cap_data = _load_json(f"{DATA_DIR}/capability_subset.json")
     questions = [MCQuestion(**q) for q in cap_data["questions"][:30]]  # small slice for the sweep itself
 
+    parsed_coefficient_shortlist = (
+        [float(x) for x in coefficient_shortlist.split(",") if x.strip()] if coefficient_shortlist else None
+    )
+
     judge_fn = _make_self_judge(model, tokenizer)
 
-    def measure_refusal_rate() -> float:
-        responses = _generate(model, tokenizer, val_harmful)
+    def measure_refusal_rate() -> list[str]:
+        return _generate(model, tokenizer, val_harmful)
+
+    def grade_refusal(responses: list[str]) -> float:
         report = evaluate_refusal_by_category({"validation": responses}, judge_fn=judge_fn)
         return report.aggregate_refusal_rate
 
     def measure_capability() -> float:
         return evaluate_capability(model, tokenizer, questions, device="cuda")
 
-    result = run_ablation_sweep(
-        model, directions, measure_refusal_rate, measure_capability, layer_shortlist=parsed_layer_shortlist
-    )
+    if bands:
+        result = run_band_sweep(
+            model, directions, [b.strip() for b in bands.split(",") if b.strip()],
+            measure_refusal_rate, measure_capability,
+            coefficient_shortlist=parsed_coefficient_shortlist,
+            grade_refusal=grade_refusal,
+        )
+    else:
+        result = run_ablation_sweep(
+            model, directions, measure_refusal_rate, measure_capability,
+            layer_shortlist=parsed_layer_shortlist,
+            coefficient_shortlist=parsed_coefficient_shortlist,
+            grade_refusal=grade_refusal,
+        )
 
     out_path = f"{CACHE_DIR}/sweep_result_{model_name.replace('/', '_')}{result_suffix}.json"
     with open(out_path, "w") as f:
@@ -367,24 +500,31 @@ def run_full_pipeline(
     directions_path: str | None = None,
     result_suffix: str = "",
     save_checkpoint: bool = False,
+    preserve_norms: bool = True,
+    method: str = "directional",
+    judge_id: str = "",
+    checkpoint_only: bool = False,
+    band: str = "",
 ):
     """Stages [5a]/[5b]/[6]/[7]/[8] for one model, given the sweep's chosen operating
     point. Produces the refusal-rate + capability tables and the tradeoff curve that
     go straight into the README (PRD §11).
 
     `directions_path`: optional override for which directions file to load — defaults
-    to the usual `directions_{tag}.pt` convention. Lets you point this at
-    `directions_purified_{tag}.pt` (or any other variant) without overwriting the
-    plain-tag file on the volume.
+    to the usual `directions_{tag}.pt` convention.
     `result_suffix`: appended to the output filename so a purified (or otherwise
     non-default) run doesn't overwrite the default run's results_{tag}.json.
     `save_checkpoint`: when True, write the weight-ablated model + tokenizer to the
-    volume under `{CACHE_DIR}/checkpoints/{tag}/weight_coeff{best_coefficient}` so it
-    can be loaded standalone later or pushed to HF Hub via `push_checkpoint_to_hub`.
-    Defaults to False so eval-only runs keep today's cost/behavior (no extra disk
-    write, no extra volume.commit() payload).
+    volume under `{CACHE_DIR}/checkpoints/{tag}/weight_coeff{best_coefficient}`.
+    `preserve_norms`: when True (default), rescales each edited weight row back to its
+    initial L2 norm (grimjim formulation) across 2D and 3D MoE projections.
+    `checkpoint_only`: skip every eval and just ablate + save - the cheap path when
+    the operating point is already chosen and evals run later via `--stage compare`.
+    `band`: e.g. "24-35" - ablate each layer in the band with its own direction and
+    leave the rest untouched, instead of broadcasting `best_layer`'s direction.
     """
     _add_src_to_path()
+    import os
     import torch
 
     from ablate_runtime import install_ablation_hooks, remove_hooks
@@ -393,17 +533,32 @@ def run_full_pipeline(
     from eval_refusal import evaluate_refusal_by_category
     from rescale import TradeoffCurve, TradeoffPoint
 
+    if method not in {"directional", "ara"}:
+        raise ValueError("method must be 'directional' or 'ara'")
+    if method == "ara" and save_checkpoint:
+        raise ValueError("save_checkpoint is not supported for the experimental ARA path")
     model, tokenizer = _load_model_and_tokenizer(model_name)
     tag = model_name.replace("/", "_")
     directions_path = directions_path or f"{CACHE_DIR}/directions_{tag}.pt"
     per_layer_directions = torch.load(directions_path, map_location="cuda")
     num_layers = per_layer_directions.shape[0]
-    # per layer_sweep.run_ablation_sweep: the sweep's chosen layer names *which*
-    # direction to use, not where to intervene — broadcast it model-wide so this
-    # matches exactly what the sweep measured (PRD §5 row 2/3 depend on that match).
-    directions = per_layer_directions[best_layer].unsqueeze(0).expand(num_layers, -1)
+    if band:
+        from layer_sweep import band_directions
 
-    import os
+        directions = band_directions(per_layer_directions, band)
+    else:
+        directions = per_layer_directions[best_layer].unsqueeze(0).expand(num_layers, -1)
+    variant = f"band{band}_" if band else ""
+
+    if checkpoint_only:
+        if method != "directional":
+            raise ValueError("checkpoint_only supports only the directional method")
+        ablate_weights_(model, directions, coefficient=best_coefficient, preserve_norms=preserve_norms)
+        checkpoint_path = f"{CACHE_DIR}/checkpoints/{tag}/weight_{variant}coeff{best_coefficient}"
+        _save_checkpoint(model, tokenizer, checkpoint_path)
+        volume.commit()
+        print(f"Saved weight-ablated checkpoint to {checkpoint_path}")
+        return {"checkpoints_saved": {"weight": checkpoint_path}}
 
     category_dir = "/root/data/eval_categories"
     category_prompts = {}
@@ -416,7 +571,11 @@ def run_full_pipeline(
     cap_data = _load_json(f"{DATA_DIR}/capability_subset.json")
     questions = [MCQuestion(**q) for q in cap_data["questions"]]
 
-    judge_fn = _make_self_judge(model, tokenizer)
+    judge_model = judge_tokenizer = None
+    if judge_id:
+        judge_fn, judge_model, judge_tokenizer = _make_external_judge(judge_id)
+    else:
+        judge_fn = _make_self_judge(model, tokenizer)
 
     # --- baseline (no ablation) - clean model throughout, judge is unambiguous here ---
     baseline_responses = {c: _generate(model, tokenizer, p) for c, p in category_prompts.items()}
@@ -430,12 +589,9 @@ def run_full_pipeline(
     for coeff in coefficients:
         handles = install_ablation_hooks(model, directions, coefficient=coeff)
         responses = {c: _generate(model, tokenizer, p) for c, p in category_prompts.items()}
-        # capability must be measured *under* ablation - that's the whole point of
-        # this loop - so it comes before remove_hooks.
         capability = evaluate_capability(model, tokenizer, questions, device="cuda")
         remove_hooks(handles)
-        # judge the already-generated text with the clean (unablated) model, so a
-        # capability-degraded judge can't itself corrupt the refusal-rate reading.
+        # Judge with the clean (unablated) model
         refusal = evaluate_refusal_by_category(responses, judge_fn=judge_fn)
         tradeoff_points.append(
             TradeoffPoint(
@@ -445,30 +601,107 @@ def run_full_pipeline(
         )
 
     # --- permanent weight-level ablation at the chosen operating point ---
-    # (no hooks to remove - the edit is in the weights themselves, so the judge here
-    # necessarily runs on the same altered model that generated the responses, which
-    # is correct: that's what would actually be shipped.)
-    ablate_weights_(model, directions, coefficient=best_coefficient)
+    # To avoid self-judge mutation bias without loading a 2nd copy of the model into
+    # VRAM, we backup weights on CPU only if needed—or simpler: we snapshot the model's
+    # residual-write weights on CPU before mutating, generate with the mutated weights,
+    # restore clean weights temporarily to run `judge_fn`, and re-apply the edit.
+    from model_utils import (
+        get_decoder_layers,
+        get_residual_write_modules,
+        get_residual_write_modules_with_post_norms,
+    )
+
+    clean_weight_snapshots = []
+    for layer in get_decoder_layers(model):
+        for proj in get_residual_write_modules(layer):
+            w_tensor = proj.data if isinstance(proj, torch.nn.Parameter) else proj.weight.data
+            b_tensor = getattr(proj, "bias", None)
+            clean_weight_snapshots.append((
+                proj,
+                w_tensor.detach().cpu().clone(),
+                b_tensor.data.detach().cpu().clone() if b_tensor is not None else None,
+            ))
+    # ablate_weights_ also edits the (untied) token embeddings.
+    embedding = model.get_input_embeddings()
+    clean_weight_snapshots.append((embedding, embedding.weight.data.detach().cpu().clone(), None))
+
+    if method == "directional":
+        ablate_weights_(
+            model,
+            directions,
+            coefficient=best_coefficient,
+            preserve_norms=preserve_norms,
+        )
+    else:
+        from ablate_ara import optimize_weight_ara
+        from model_utils import get_decoder_layers
+
+        # ARA uses the extracted prompt activations as a compact, deterministic
+        # calibration set.  The directional path remains the default fast engine.
+        harmful = _load_json(f"{DATA_DIR}/harmful_prompts_train.json")[:64]
+        harmless = _load_json(f"{DATA_DIR}/harmless_prompts_train.json")[:64]
+        from extract_direction import extract_activations
+        harmful_acts = extract_activations(model, tokenizer, harmful, device="cuda", batch_size=8)
+        harmless_acts = extract_activations(model, tokenizer, harmless, device="cuda", batch_size=8)
+        for layer_idx, layer in enumerate(get_decoder_layers(model)):
+            for proj, _ in get_residual_write_modules_with_post_norms(layer):
+                if not isinstance(proj, torch.nn.Module) or not hasattr(proj, "weight"):
+                    continue
+                with torch.no_grad():
+                    xg = harmless_acts.activations[layer_idx]
+                    xb = harmful_acts.activations[layer_idx]
+                    yg = xg @ proj.weight.data.float().T
+                    yb = xb @ proj.weight.data.float().T
+                    updated, _ = optimize_weight_ara(
+                        proj.weight.data, xg, yg, xb, yb, max_iter=5
+                    )
+                    proj.weight.data.copy_(updated.to(proj.weight.device))
     weight_responses = {c: _generate(model, tokenizer, p) for c, p in category_prompts.items()}
     weight_capability = evaluate_capability(model, tokenizer, questions, device="cuda")
+
+    # Temporarily restore clean weights so `judge_fn` grades using the unmutated model
+    for proj, w_cpu, b_cpu in clean_weight_snapshots:
+        if isinstance(proj, torch.nn.Parameter):
+            proj.data.copy_(w_cpu.to(proj.device))
+        else:
+            proj.weight.data.copy_(w_cpu.to(proj.weight.device))
+            if b_cpu is not None and proj.bias is not None:
+                proj.bias.data.copy_(b_cpu.to(proj.bias.device))
+
     weight_refusal = evaluate_refusal_by_category(weight_responses, judge_fn=judge_fn)
+    del clean_weight_snapshots
+
+    # Re-apply permanent weight ablation for checkpoint saving
+    if save_checkpoint and method == "directional":
+        ablate_weights_(
+            model,
+            directions,
+            coefficient=best_coefficient,
+            preserve_norms=preserve_norms,
+        )
+
     tradeoff_points.append(
         TradeoffPoint(
-            best_coefficient, "weight", False, weight_refusal.aggregate_refusal_rate, weight_capability,
+            best_coefficient,
+            "weight",
+            preserve_norms,
+            weight_refusal.aggregate_refusal_rate,
+            weight_capability,
             judge_fallback_rate=weight_refusal.judge_fallback_rate,
         )
     )
 
     checkpoints_saved = {}
-    if save_checkpoint:
-        checkpoint_path = f"{CACHE_DIR}/checkpoints/{tag}/weight_coeff{best_coefficient}"
-        _save_checkpoint(model, tokenizer, checkpoint_path)
-        checkpoints_saved["weight"] = checkpoint_path
+    if save_checkpoint and method == "directional":
+        checkpoints_saved["weight"] = f"{CACHE_DIR}/checkpoints/{tag}/weight_{variant}coeff{best_coefficient}"
 
     curve = TradeoffCurve(points=tradeoff_points)
 
     results = {
         "model": model_name,
+        "preserve_norms": preserve_norms,
+        "method": method,
+        "judge_id": judge_id or None,
         "baseline_refusal_by_category": {
             c.category: c.refusal_rate for c in baseline_refusal.per_category
         },
@@ -479,10 +712,8 @@ def run_full_pipeline(
         "weight_ablated_capability": weight_capability,
         "tradeoff_curve": curve.as_table_rows(),
         "judge_fallback_rate_baseline": baseline_refusal.judge_fallback_rate,
+        "judge_fallback_rate_weight": weight_refusal.judge_fallback_rate,
         "checkpoints_saved": checkpoints_saved,
-        # A refusal rate near 0 can't distinguish "answers the question" from
-        # "degenerate text the grader doesn't recognize as a refusal" - keep a few
-        # raw generations per category so coherence can actually be read.
         "sample_responses": {
             c: [
                 {"prompt": p, "baseline": b, "weight_ablated": w}
@@ -498,7 +729,13 @@ def run_full_pipeline(
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     volume.commit()
+    if judge_model is not None:
+        del judge_model, judge_tokenizer
     print(json.dumps(results, indent=2))
+    # Saved after the results JSON is committed, so a failed save can't discard the evals.
+    if "weight" in checkpoints_saved:
+        _save_checkpoint(model, tokenizer, checkpoints_saved["weight"])
+        volume.commit()
     return results
 
 
@@ -511,26 +748,26 @@ def run_benchmarks(
     mmlu_pro_questions: int = 500,
     kl_prompts: int = 100,
     result_suffix: str = "",
+    preserve_norms: bool = True,
 ):
     """Harder capability checks than ARC-Easy (which saturates at 27B): MMLU-Pro
-    accuracy and KL(base || ablated) on harmless prompts, for the base model and the
-    same weight edit run_full_pipeline applies (sweep's layer broadcast model-wide).
-
-    Base and ablated are measured in one container - evaluate, edit in place,
-    evaluate again - so both see identical questions/prompts and the KL compares
-    distributions from the same forward-pass code path. The edit is in memory only;
-    nothing here writes or replaces a checkpoint."""
+    accuracy and KL(base || ablated) on harmless prompts (both first-token and
+    multi-token teacher-forced sequence KL), for the base model and the same weight
+    edit run_full_pipeline applies.
+    """
     _add_src_to_path()
     import os
 
     os.environ["HF_HOME"] = HF_CACHE_DIR
     import torch
+    import torch.nn.functional as F
     from collections import defaultdict
 
     from ablate_weights import ablate_weights_
     from build_mmlu_pro_subset import build_and_save as build_mmlu_pro
     from eval_capability import MCQuestion, score_questions
     from eval_kl import first_token_log_probs, mean_kl_divergence
+    from model_utils import format_chat_prompt
 
     mmlu_path = f"{DATA_DIR}/mmlu_pro_subset_{mmlu_pro_questions}.json"
     if not os.path.exists(mmlu_path):
@@ -558,18 +795,83 @@ def run_benchmarks(
             "by_category": {c: sum(v) / len(v) for c, v in sorted(per_cat.items())},
         }
 
+    # --- 1. Base model evaluation ---
     base_mmlu = mmlu_report(score_questions(model, tokenizer, questions, device="cuda"))
     base_log_probs = first_token_log_probs(model, tokenizer, harmless, device="cuda")
 
-    ablate_weights_(model, directions, coefficient=best_coefficient)
+    # Cache teacher-forced generations (first 50 harmless prompts, 100 tokens) from base model
+    tf_prompts = harmless[:50]
+    tf_batches = []
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id
+    with torch.no_grad():
+        formatted_tf = [format_chat_prompt(tokenizer, p) for p in tf_prompts]
+        for i in range(0, len(formatted_tf), 4):
+            enc = tokenizer(
+                formatted_tf[i : i + 4],
+                return_tensors="pt",
+                padding=True,
+                add_special_tokens=False,
+            ).to("cuda")
+            p_len = enc.input_ids.shape[1]
+            gen_tokens = model.generate(
+                **enc, max_new_tokens=100, do_sample=False, pad_token_id=pad_id
+            )
+            if gen_tokens.shape[1] <= p_len:
+                continue
+            gen_slice = gen_tokens[:, p_len:]
+            if eos_id is not None:
+                is_eos = (gen_slice == eos_id).int()
+                eos_cumsum = is_eos.cumsum(dim=1)
+                gen_mask = ((eos_cumsum == 0) | ((eos_cumsum == 1) & (is_eos == 1))).float()
+            else:
+                gen_mask = torch.ones_like(gen_slice, dtype=torch.float32)
+            full_mask = torch.cat([enc.attention_mask.float(), gen_mask], dim=1).long()
+            b_logits = model(gen_tokens, attention_mask=full_mask).logits[:, p_len - 1 : -1, :].float()
+            tf_batches.append((
+                gen_tokens.cpu(),
+                full_mask.cpu(),
+                gen_mask.cpu(),
+                p_len,
+                F.log_softmax(b_logits, dim=-1).cpu(),
+            ))
+
+    # --- 2. Mutate weights in-place with norm preservation ---
+    ablate_weights_(
+        model,
+        directions,
+        coefficient=best_coefficient,
+        preserve_norms=preserve_norms,
+    )
+
+    # --- 3. Ablated model evaluation ---
     ablated_mmlu = mmlu_report(score_questions(model, tokenizer, questions, device="cuda"))
     ablated_log_probs = first_token_log_probs(model, tokenizer, harmless, device="cuda")
 
+    # Compute teacher-forced sequence KL against cached base log-probs
+    total_seq_kl = 0.0
+    total_seq_tokens = 0.0
+    with torch.no_grad():
+        for gen_tokens_cpu, full_mask_cpu, gen_mask_cpu, p_len, base_lp_cpu in tf_batches:
+            gen_tokens = gen_tokens_cpu.to("cuda")
+            full_mask = full_mask_cpu.to("cuda")
+            a_logits = model(gen_tokens, attention_mask=full_mask).logits[:, p_len - 1 : -1, :].float()
+            abl_lp_cpu = F.log_softmax(a_logits, dim=-1).cpu()
+            p_base = base_lp_cpu.exp()
+            token_kl = (p_base * (base_lp_cpu - abl_lp_cpu)).sum(dim=-1)
+            total_seq_kl += (token_kl * gen_mask_cpu).sum().item()
+            total_seq_tokens += gen_mask_cpu.sum().item()
+    del tf_batches
+
+    seq_kl_nats = total_seq_kl / max(total_seq_tokens, 1.0)
+    kl_degraded = seq_kl_nats > 0.3
     same_top1 = (base_log_probs.argmax(-1) == ablated_log_probs.argmax(-1)).float().mean().item()
+
     results = {
         "model": model_name,
         "best_layer": best_layer,
         "best_coefficient": best_coefficient,
+        "preserve_norms": preserve_norms,
         "directions_path": directions_path,
         "mmlu_pro": {
             "num_questions": len(questions),
@@ -580,6 +882,9 @@ def run_benchmarks(
         "kl_harmless": {
             "num_prompts": len(harmless),
             "mean_kl_base_to_ablated_nats": mean_kl_divergence(base_log_probs, ablated_log_probs),
+            "sequence_teacher_forced_kl_nats": seq_kl_nats,
+            "sequence_kl_degraded": kl_degraded,
+            "sequence_kl_threshold_nats": 0.3,
             "first_token_top1_agreement": same_top1,
         },
     }
@@ -620,6 +925,7 @@ def _eval_battery(
     max_new_tokens: int,
     refusal_judge=None,
     patch_judge=None,
+    defer_grading: bool = False,
 ):
     """Run the full evaluation battery on one already-loaded model and return
     (metrics_dict, first_token_log_probs). Factored out of compare_models so the
@@ -631,19 +937,19 @@ def _eval_battery(
     `refusal_judge` / `patch_judge`: if given, used to grade refusals and patches
     instead of this model's own self-judge - the caller passes one fixed external
     judge for both models so the grades are comparable (removes the self-judge bias,
-    where each model, especially the abliterated one, judges its own outputs)."""
-    from eval_capability import score_questions
-    from eval_defensive import build_patch_prompts, grade_patches
-    from eval_kl import first_token_log_probs
-    from eval_refusal import evaluate_refusal_by_category
+    where each model, especially the abliterated one, judges its own outputs).
 
-    # --- refusal by category (self-judge: this model grades its own outputs) ---
+    `defer_grading`: skip refusal + patch grading and keep the raw generations under
+    metrics["_ungraded"], for `_grade_battery` to grade later with another model
+    (compare_models uses the clean baseline as judge for the abliterated outputs)."""
+    from eval_capability import score_questions
+    from eval_defensive import build_patch_prompts
+    from eval_kl import first_token_log_probs
+
     responses_by_cat = {
         c: _generate(model, tokenizer, prompts, max_new_tokens=max_new_tokens)
         for c, prompts in category_prompts.items()
     }
-    judge_fn = refusal_judge if refusal_judge is not None else _make_self_judge(model, tokenizer)
-    refusal = evaluate_refusal_by_category(responses_by_cat, judge_fn=judge_fn)
 
     # --- general capability (MMLU-Pro) and defensive knowledge (security MCQ) ---
     mmlu = _mmlu_report(score_questions(model, tokenizer, mmlu_questions, device="cuda"), mmlu_categories)
@@ -661,33 +967,50 @@ def _eval_battery(
     # --- patch synthesis (free-form fix, graded by this model's own patch judge) ---
     patch_prompts = build_patch_prompts(patch_tasks)
     patches = _generate(model, tokenizer, patch_prompts, max_new_tokens=max(max_new_tokens, 512))
-    patch_judge_fn = patch_judge if patch_judge is not None else _make_patch_fix_judge(model, tokenizer)
-    patch = grade_patches(patch_tasks, patches, patch_judge_fn)
 
     log_probs = first_token_log_probs(model, tokenizer, harmless, device="cuda")
 
     metrics = {
-        "refusal_by_category": {c.category: c.refusal_rate for c in refusal.per_category},
-        "refusal_aggregate": refusal.aggregate_refusal_rate,
-        "judge_fallback_rate": refusal.judge_fallback_rate,
         "mmlu_pro": mmlu,
-        "defensive": {
-            "security_mcq": security,
-            "vuln_detection": vuln,
-            "patch_synthesis": {
-                "fix_rate": patch["fix_rate"],
-                "fixed": patch["fixed"],
-                "total": patch["total"],
-            },
+        "defensive": {"security_mcq": security, "vuln_detection": vuln},
+        # Raw refusal-prompt generations, so a refusal rate can be checked by eye.
+        "sample_refusal_responses": {
+            c: [r[:400] for r in responses[:2]] for c, responses in responses_by_cat.items()
         },
-        # A fix-rate alone can't tell "wrote a real patch" from "emitted garbage the
-        # judge waved through" - keep a couple of raw generations to eyeball coherence.
-        "sample_patches": [
-            {"description": t.get("description", ""), "patch": p[:600], "grade": g}
-            for t, p, g in zip(patch_tasks[:2], patches[:2], patch["labels"][:2])
-        ],
+        "_ungraded": {"responses_by_cat": responses_by_cat, "patches": patches},
     }
+    if not defer_grading:
+        _grade_battery(
+            metrics, patch_tasks,
+            refusal_judge if refusal_judge is not None else _make_self_judge(model, tokenizer),
+            patch_judge if patch_judge is not None else _make_patch_fix_judge(model, tokenizer),
+        )
     return metrics, log_probs
+
+
+def _grade_battery(metrics: dict, patch_tasks: list[dict], refusal_judge, patch_judge) -> None:
+    """Fill in the judge-graded parts of an `_eval_battery` metrics dict (refusal
+    rates, patch fix rate) from its `_ungraded` generations, in place."""
+    from eval_defensive import grade_patches
+    from eval_refusal import evaluate_refusal_by_category
+
+    raw = metrics.pop("_ungraded")
+    refusal = evaluate_refusal_by_category(raw["responses_by_cat"], judge_fn=refusal_judge)
+    patch = grade_patches(patch_tasks, raw["patches"], patch_judge)
+    metrics["refusal_by_category"] = {c.category: c.refusal_rate for c in refusal.per_category}
+    metrics["refusal_aggregate"] = refusal.aggregate_refusal_rate
+    metrics["judge_fallback_rate"] = refusal.judge_fallback_rate
+    metrics["defensive"]["patch_synthesis"] = {
+        "fix_rate": patch["fix_rate"],
+        "fixed": patch["fixed"],
+        "total": patch["total"],
+    }
+    # A fix-rate alone can't tell "wrote a real patch" from "emitted garbage the
+    # judge waved through" - keep a couple of raw generations to eyeball coherence.
+    metrics["sample_patches"] = [
+        {"description": t.get("description", ""), "patch": p[:600], "grade": g}
+        for t, p, g in zip(patch_tasks[:2], raw["patches"][:2], patch["labels"][:2])
+    ]
 
 
 @app.function(image=image, gpu=DEFAULT_GPU, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
@@ -796,16 +1119,26 @@ def compare_models(
         patch_judge=patch_judge,
     )
 
-    # --- baseline, then free it before loading the abliterated model ---
-    base_model, base_tok = _load_model_and_tokenizer(baseline_id)
-    base_metrics, base_log_probs = _eval_battery(base_model, base_tok, **battery_kwargs)
-    del base_model, base_tok
+    # --- abliterated first, grading deferred unless a fixed external judge is loaded;
+    # freed before the baseline loads (two 35B models don't fit on one card) ---
+    abl_model, abl_tok = _load_model_and_tokenizer(abliterated_id)
+    abl_metrics, abl_log_probs = _eval_battery(
+        abl_model, abl_tok, defer_grading=not judge_id, **battery_kwargs
+    )
+    del abl_model, abl_tok
     gc.collect()
     torch.cuda.empty_cache()
 
-    abl_model, abl_tok = _load_model_and_tokenizer(abliterated_id)
-    abl_metrics, abl_log_probs = _eval_battery(abl_model, abl_tok, **battery_kwargs)
-    del abl_model, abl_tok
+    # --- baseline; without --judge-id it is the judge for both models' outputs, so
+    # the abliterated model never grades itself ---
+    base_model, base_tok = _load_model_and_tokenizer(baseline_id)
+    base_metrics, base_log_probs = _eval_battery(base_model, base_tok, **battery_kwargs)
+    if not judge_id:
+        _grade_battery(
+            abl_metrics, patch_task_rows,
+            _make_self_judge(base_model, base_tok), _make_patch_fix_judge(base_model, base_tok),
+        )
+    del base_model, base_tok
     if judge_model is not None:
         del judge_model, judge_tok
     gc.collect()
@@ -823,13 +1156,12 @@ def compare_models(
             "models - comparable across the A/B and free of the self-judge bias."
         )
     else:
-        refusal_judge_label = "self-judge (each model grades its own outputs)"
-        patch_judge_label = "self-judge (each model grades its own patches)"
+        refusal_judge_label = f"baseline model ({baseline_id}) grades both models"
+        patch_judge_label = f"baseline model ({baseline_id}) grades both models"
         refusal_caveat = (
-            "Self-judge: each model judges its own outputs. The abliterated model "
-            "may be less inclined to flag its own refusals, so its refusal rate is a "
-            "lower bound relative to a fixed external judge. Pass --judge-id to remove "
-            "this bias."
+            "The unmodified baseline model judges both models' outputs, so the "
+            "abliterated model never grades itself. The judge is still the base model "
+            "under test; pass --judge-id for a fully independent judge."
         )
 
     results = {
@@ -873,6 +1205,10 @@ def compare_models(
         "sample_patches": {
             "baseline": base_metrics["sample_patches"],
             "abliterated": abl_metrics["sample_patches"],
+        },
+        "sample_refusal_responses": {
+            "baseline": base_metrics["sample_refusal_responses"],
+            "abliterated": abl_metrics["sample_refusal_responses"],
         },
     }
 
@@ -1037,6 +1373,9 @@ def main(
     gpu: str = "",
     purified: bool = False,
     layer_shortlist: str = "",
+    coefficient_shortlist: str = "",
+    bands: str = "",
+    band: str = "",
     best_layer: int = -1,
     best_coefficient: float = 1.0,
     result_suffix: str = "",
@@ -1052,10 +1391,14 @@ def main(
     patch_tasks: int = 50,
     max_new_tokens: int = 128,
     judge_id: str = "",
+    method: str = "directional",
+    checkpoint_only: bool = False,
+    memory_gb: int = 0,
 ):
     """Convenience CLI: `modal run modal_app.py --stage <stage> [--gpu H100] ...`.
 
-    Stages: prepare_data | extract | sweep | full | benchmarks | compare | flagship | push.
+    Stages: prepare_data | inspect-model | extract | sweep | full | benchmarks |
+    compare | flagship | push.
 
     `--stage compare` needs --baseline-id and --abliterated-id (two separately
     published HF repos) and evaluates both on the same battery - it does not use
@@ -1068,31 +1411,50 @@ def main(
     rather than a parameter on each function because Modal fixes a function's GPU in
     its decorator; Function.with_options is the supported per-call override.
 
+    `--method ara` selects the experimental arbitrary-rank optimizer for `full`.
     `--purified` makes sweep/full use directions_purified_{tag}.pt (extract with
     --purified writes both raw and purified files).
+    `--checkpoint-only` (with `full`) skips all evals: ablate, save, exit.
+    `--bands "24-35"` (sweep) / `--band "24-35"` (full) use per-layer directions
+    across a layer band instead of one layer's direction broadcast model-wide.
+    `--memory-gb` reserves container RAM; checkpoint saves serialize from CPU, so
+    size it to ~2x the bf16 weights for MoE models (e.g. 160 for a 35B MoE).
     """
     tag = model_name.replace("/", "_")
     directions_path = f"{CACHE_DIR}/directions_{'purified_' if purified else ''}{tag}.pt"
 
     def on_gpu(fn):
-        return fn.with_options(gpu=gpu) if gpu else fn
+        options = {}
+        if gpu:
+            options["gpu"] = gpu
+        if memory_gb:
+            options["memory"] = memory_gb * 1024
+        return fn.with_options(**options) if options else fn
 
     if stage == "prepare_data":
         prepare_data.remote()
+    elif stage == "inspect-model":
+        on_gpu(inspect_model).remote(model_name)
     elif stage == "extract":
         on_gpu(extract_and_save_direction).remote(model_name, tag, purified=purified)
     elif stage == "sweep":
         on_gpu(run_sweep).remote(
             model_name, directions_path,
             layer_shortlist=layer_shortlist or None, result_suffix=result_suffix,
+            coefficient_shortlist=coefficient_shortlist or None,
+            bands=bands or None,
         )
     elif stage == "full":
-        if best_layer < 0:
-            raise ValueError("--stage full needs --best-layer (the sweep's winner)")
+        if best_layer < 0 and not band:
+            raise ValueError("--stage full needs --best-layer (the sweep's winner) or --band")
         on_gpu(run_full_pipeline).remote(
             model_name, best_layer, best_coefficient,
             directions_path=directions_path, result_suffix=result_suffix,
-            save_checkpoint=save_checkpoint,
+            save_checkpoint=save_checkpoint or checkpoint_only,
+            method=method,
+            judge_id=judge_id,
+            checkpoint_only=checkpoint_only,
+            band=band,
         )
     elif stage == "flagship":
         on_gpu(flagship_run).remote(model_name, layer=best_layer if best_layer >= 0 else None)

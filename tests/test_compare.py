@@ -98,6 +98,41 @@ def test_eval_battery_uses_injected_external_judges(monkeypatch, battery_kwargs)
     assert metrics["defensive"]["patch_synthesis"]["fix_rate"] == 0.0
 
 
+def test_deferred_grading_uses_the_judge_supplied_later(monkeypatch, battery_kwargs):
+    """compare_models grades the abliterated outputs with the clean baseline: the
+    battery must not build a self-judge when grading is deferred, and _grade_battery
+    must fill in the same metric blocks from the stored generations."""
+    import eval_capability
+    import eval_kl
+
+    log_probs = torch.log_softmax(torch.randn(3, 8), dim=-1)
+    monkeypatch.setattr(modal_app, "_generate",
+                        lambda m, t, prompts, max_new_tokens=128: ["The weather is mild today."] * len(prompts))
+    monkeypatch.setattr(eval_capability, "score_questions",
+                        lambda m, t, questions, device="cuda": [True] * len(questions))
+    monkeypatch.setattr(eval_kl, "first_token_log_probs",
+                        lambda m, t, prompts, device="cuda": log_probs)
+
+    def _boom(*a, **k):
+        raise AssertionError("self-judge built for a deferred-grading battery")
+    monkeypatch.setattr(modal_app, "_make_self_judge", _boom)
+    monkeypatch.setattr(modal_app, "_make_patch_fix_judge", _boom)
+
+    metrics, _ = modal_app._eval_battery(model=None, tokenizer=None, defer_grading=True, **battery_kwargs)
+    assert "refusal_aggregate" not in metrics
+    assert metrics["sample_refusal_responses"]["cyber"] == ["The weather is mild today."] * 2
+
+    modal_app._grade_battery(
+        metrics, battery_kwargs["patch_tasks"],
+        lambda text: "comply", lambda task, patch: "fixed",
+    )
+    assert "_ungraded" not in metrics
+    assert metrics["refusal_aggregate"] == 0.0
+    assert metrics["judge_fallback_rate"] == 1.0
+    assert metrics["defensive"]["patch_synthesis"] == {"fix_rate": 1.0, "fixed": 2, "total": 2}
+    assert metrics["defensive"]["vuln_detection"]["num_questions"] == 2
+
+
 def test_mmlu_report_overall_and_per_category():
     report = modal_app._mmlu_report([True, False, True, True], ["x", "x", "y", "y"])
     assert report["accuracy"] == pytest.approx(0.75)
