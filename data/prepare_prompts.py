@@ -1,13 +1,4 @@
-"""Builds the harmful/harmless train/held-out prompt splits (PRD §6.1, requirement 1).
-
-Requires network access to HuggingFace Hub — run this on Modal (see modal_app.py's
-`prepare_data` function), not in a sandboxed/offline environment. Harmful prompts come
-from AdvBench; harmless contrast prompts from Alpaca, per the source technique
-(Arditi et al.) and PRD §6.1/§7.
-
-The harmful prompt set exists solely to compute/validate the refusal direction and
-measure refusal rate — see PRD §4 (Non-Goals) and §6.2 (safety handling).
-"""
+"""Builds the harmful/harmless train/held-out prompt splits (PRD §6.1, requirement 1)."""
 from __future__ import annotations
 
 import json
@@ -19,20 +10,38 @@ SEED = 0
 
 
 def load_advbench_harmful(limit: int | None = None) -> list[str]:
-    """AdvBench harmful-behaviors set, via the `walledai/AdvBench` HF dataset (a
-    commonly-used mirror of the original llm-attacks harmful_behaviors.csv)."""
+    """AdvBench harmful-behaviors set via `walledai/AdvBench`."""
     from datasets import load_dataset
 
     ds = load_dataset("walledai/AdvBench", split="train")
-    prompts = [row["prompt"] for row in ds]
+    prompts = [row["prompt"] for row in ds if row.get("prompt")]
+    if limit:
+        prompts = prompts[:limit]
+    return prompts
+
+
+def load_enriched_harmful(limit: int | None = None) -> list[str]:
+    """Multi-style harmful set (`Bahushruth/abliteration-harmful-enriched`, 35 categories
+    x 10 styles). Falls back to AdvBench if unavailable."""
+    from datasets import load_dataset
+
+    try:
+        ds = load_dataset("Bahushruth/abliteration-harmful-enriched", split="train")
+        prompts = [row["text"] for row in ds if row.get("text")]
+    except (ConnectionError, ImportError, OSError, ValueError) as exc:
+        print(
+            "WARNING: could not load the enriched harmful dataset; "
+            f"falling back to AdvBench ({exc})"
+        )
+        prompts = load_advbench_harmful(limit=None)
+
     if limit:
         prompts = prompts[:limit]
     return prompts
 
 
 def load_alpaca_harmless(limit: int | None = None) -> list[str]:
-    """Alpaca instructions with no input field, so each is a self-contained prompt
-    comparable in form to the AdvBench harmful instructions."""
+    """Alpaca instructions with no input field."""
     from datasets import load_dataset
 
     ds = load_dataset("tatsu-lab/alpaca", split="train")
@@ -50,17 +59,25 @@ def split_train_heldout(prompts: list[str], seed: int = SEED) -> tuple[list[str]
     return shuffled[:cut], shuffled[cut:]
 
 
-def build_and_save(output_dir: str | Path, num_harmful: int = 300, num_harmless: int = 300) -> None:
+def build_and_save(
+    output_dir: str | Path,
+    num_harmful: int = 300,
+    num_harmless: int = 300,
+    use_enriched: bool = True,
+) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    harmful = load_advbench_harmful(limit=num_harmful)
+    harmful = (
+        load_enriched_harmful(limit=num_harmful)
+        if use_enriched
+        else load_advbench_harmful(limit=num_harmful)
+    )
     harmless = load_alpaca_harmless(limit=num_harmless)
 
     harmful_train, harmful_heldout = split_train_heldout(harmful)
     harmless_train, harmless_heldout = split_train_heldout(harmless)
 
-    # Assert-no-overlap check per PRD §6.1 requirement 1 ("never overlap").
     assert not set(harmful_train) & set(harmful_heldout)
     assert not set(harmless_train) & set(harmless_heldout)
 
