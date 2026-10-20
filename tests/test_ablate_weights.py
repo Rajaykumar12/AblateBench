@@ -105,6 +105,46 @@ def test_ablate_weights_skips_degenerate_layer():
     assert torch.allclose(o_proj.weight.data, original_weight)
 
 
+class _TinyModelWithEmbeddings(_TinyModel):
+    def __init__(self, hidden_dim: int, num_layers: int, tied: bool):
+        super().__init__(hidden_dim, num_layers)
+        self.embed = nn.Embedding(20, hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, 20, bias=False)
+        if tied:
+            self.lm_head.weight = self.embed.weight
+
+    def get_input_embeddings(self):
+        return self.embed
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def test_ablate_weights_orthogonalizes_untied_embeddings():
+    """Layer 0's runtime hook strips the direction from the embedding's contribution
+    too, so the weight edit must remove it from every embedding row."""
+    torch.manual_seed(4)
+    model = _TinyModelWithEmbeddings(hidden_dim=8, num_layers=2, tied=False)
+    direction = torch.randn(8)
+    direction = direction / direction.norm()
+
+    ablate_weights_(model, direction.expand(2, -1).clone(), coefficient=1.0)
+
+    assert torch.allclose(model.embed.weight @ direction, torch.zeros(20), atol=1e-5)
+
+
+def test_ablate_weights_leaves_tied_embeddings_alone():
+    torch.manual_seed(5)
+    model = _TinyModelWithEmbeddings(hidden_dim=8, num_layers=1, tied=True)
+    original = model.embed.weight.data.clone()
+    direction = torch.randn(1, 8)
+    direction[0] = direction[0] / direction[0].norm()
+
+    ablate_weights_(model, direction, coefficient=1.0)
+
+    assert torch.allclose(model.embed.weight.data, original)
+
+
 def test_get_residual_write_modules_finds_both_projections():
     model = _TinyModel(hidden_dim=4, num_layers=1)
     modules = get_residual_write_modules(model.model.layers[0])
