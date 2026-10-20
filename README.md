@@ -143,13 +143,14 @@ Hybrid linear/full-attention model (48 Gated DeltaNet + 16 full-attention layers
 ## How it works
 
 1. **`prepare_data`** (CPU) — builds harmful/harmless prompt sets and a capability MCQ subset on a shared Modal Volume.
-2. **`extract_and_save_direction`** (B200) — one forward pass per prompt, computes a per-layer difference-in-means direction, optionally purifies it via Gram-Schmidt against the harmless direction.
-3. **`run_sweep`** (B200) — broadcasts each candidate layer's direction model-wide, tests it across coefficients, grades refusal + capability.
-4. **`run_full_pipeline`** (B200) — runs baseline, runtime-hook ablation, and permanent weight ablation at the sweep's winning operating point; outputs the refusal/capability tradeoff curve.
-5. **`run_benchmarks`** (GPU) — MMLU-Pro accuracy and harmless-prompt KL divergence for the base model and the same weight edit, in one container.
-6. **`compare_models`** (B200) — evaluation-only comparison of two *separately published* checkpoints (an unabliterated baseline and an already-abliterated model). Loads each sequentially and runs the same battery: per-category refusal rate, MMLU-Pro, three defensive-security scorers (security MCQ, vulnerability detection, patch synthesis), and cross-model KL on harmless prompts. No training, no exploit generation.
-7. **`flagship_run`** (B200) — independent smoke test confirming the technique and memory footprint hold at 30B+ scale.
-8. **`push_checkpoint_to_hub`** (CPU) — reshards any checkpoint shard over 5 GB (streaming, no full-model RAM), then uploads the folder as-is.
+2. **`inspect-model`** (GPU) — non-mutating architecture probe that reports decoder paths, residual-write projections, and packed 3-D MoE expert tensors.
+3. **`extract_and_save_direction`** (B200) — one forward pass per prompt, computes a per-layer difference-in-means direction, optionally purifies it via Gram-Schmidt against the harmless direction.
+4. **`run_sweep`** (B200) — broadcasts each candidate layer's direction model-wide, tests it across coefficients, grades refusal + capability.
+5. **`run_full_pipeline`** (B200) — runs baseline, runtime-hook ablation, and permanent weight ablation at the sweep's winning operating point; outputs the refusal/capability tradeoff curve.
+6. **`run_benchmarks`** (GPU) — MMLU-Pro accuracy plus first-token and 100-token teacher-forced harmless-prompt KL divergence for the base model and the same weight edit, in one container. Sequence KL above 0.3 nats is flagged as degraded.
+7. **`compare_models`** (B200) — evaluation-only comparison of two *separately published* checkpoints (an unabliterated baseline and an already-abliterated model). Loads each sequentially and runs the same battery: per-category refusal rate, MMLU-Pro, three defensive-security scorers (security MCQ, vulnerability detection, patch synthesis), and cross-model KL on harmless prompts. No training, no exploit generation.
+8. **`flagship_run`** (B200) — independent smoke test confirming the technique and memory footprint hold at 30B+ scale.
+9. **`push_checkpoint_to_hub`** (CPU) — reshards any checkpoint shard over 5 GB (streaming, no full-model RAM), then uploads the folder as-is.
 
 Run the comparison with:
 
@@ -180,12 +181,14 @@ Refusal and patch grading use each model's own self-judge (a known bias — the 
 - **Two-tier refusal grading.** A cheap rule-based pass handles clear cases; only ambiguous responses escalate to an LLM-judge fallback.
 - **Fixed sweep grid.** Layer/coefficient candidates are a bounded shortlist, not an exhaustive search, so sweep cost stays predictable regardless of model depth.
 - **Architecture-aware weight edit.** Residual-write projections include `linear_attn.out_proj` for hybrid models. For sandwich-norm models (Gemma 2/3), where an RMSNorm sits between the projection and the residual add, the projection is orthogonalized against `normalize(g ⊙ d̂)` — the norm's per-channel scale would otherwise rotate a `d̂` component back in.
+- **Norm-preserving and MoE-aware edits.** Weight ablation can restore each row's original L2 norm and handles both 2-D projections and packed 3-D expert tensors.
+- **Experimental ARA engine.** `modal run modal_app.py --stage full --method ara` enables the bounded L-BFGS preserve/pull/push optimizer for 2-D residual-write matrices. It is evaluation-only unless a checkpoint writer is added for that experimental path.
 - **Non-thinking mode.** Prompts use `enable_thinking=False`, so hybrid-reasoning models answer directly instead of spending the generation budget inside `<think>`.
 
 ## Future work
 
-- Fix the weight-ablated self-judge bias by judging against a pre-mutation model snapshot.
-- Implement norm-preserving weight ablation to protect model capability, and test whether it (or a gentler coefficient like 0.7) recovers Qwen3.8-27B's 3.3pp MMLU-Pro drop.
+- Add a separately provisioned frozen judge by default to avoid relying on the clean-weight restoration fallback in single-model runs.
+- Extend ARA checkpoint serialization and calibration to packed 3-D expert tensors.
 - Re-run the full pipeline on Llama-3.1-8B-Instruct post chat-template-fix.
 - Add serving/inference for a saved checkpoint (deferred; preferred design is a bearer-token-gated endpoint).
 
@@ -225,6 +228,7 @@ AblateBench/
 │   ├── layer_sweep.py        # Layer/coefficient sweep
 │   ├── ablate_runtime.py     # Reversible forward-hook ablation
 │   ├── ablate_weights.py     # Permanent weight-level ablation
+│   ├── ablate_ara.py         # Experimental bounded L-BFGS arbitrary-rank optimizer
 │   ├── rescale.py            # Capability rescaling + tradeoff-curve tracking
 │   ├── eval_refusal.py       # Two-tier refusal grader (rule-based + judge fallback)
 │   ├── eval_capability.py    # MCQ capability harness (ARC-Easy, MMLU-Pro; up to 10 options)
