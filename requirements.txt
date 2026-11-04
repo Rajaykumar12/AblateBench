@@ -7,3 +7,4 @@ accelerate>=0.33.0
 datasets>=2.20.0
 numpy>=1.26.0
 pytest>=8.0.0
+optuna>=3.6
