@@ -190,3 +190,87 @@ def layer_signal_quality(harmful: ActivationSet, harmless: ActivationSet) -> tor
     purity = residual.norm(dim=-1)  # refusal_dir has norm 1, so this is already a fraction
 
     return snr * (1 - cos) * purity
+
+
+def _kmeans(x: torch.Tensor, k: int, iters: int = 50, seed: int = 0) -> torch.Tensor:
+    """Cosine k-means on the rows of x [n, d]; returns cluster labels [n]. Deterministic
+    (seeded k-means++ style init by farthest point)."""
+    xn = _unit_normalize(x)
+    g = torch.Generator().manual_seed(seed)
+    centers = [xn[torch.randint(len(xn), (1,), generator=g).item()]]
+    for _ in range(1, k):
+        sims = torch.stack([xn @ c for c in centers], dim=1).max(dim=1).values
+        centers.append(xn[sims.argmin()])
+    c = torch.stack(centers)
+    labels = torch.zeros(len(xn), dtype=torch.long)
+    for _ in range(iters):
+        labels = (xn @ c.T).argmax(dim=1)
+        new_c = torch.stack([
+            xn[labels == j].mean(0) if (labels == j).any() else c[j] for j in range(k)
+        ])
+        new_c = _unit_normalize(new_c)
+        if torch.allclose(new_c, c):
+            break
+        c = new_c
+    return labels
+
+
+def compute_refusal_subspace(
+    harmful: ActivationSet,
+    harmless: ActivationSet,
+    k: int = 3,
+    n_clusters: int = 8,
+    purified: bool = True,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Per-layer orthonormal refusal subspace [num_layers, k, hidden_dim].
+
+    Row 0 is the usual (optionally purified) difference-in-means direction. Rows
+    1..k-1 capture refusal signal it misses: the harmful prompts are clustered
+    (unlabelled, so held-out eval categories never leak in), each cluster's
+    mean-difference from the harmless mean has row 0 (and, if purified, the harmless
+    mean) projected out, and the top right-singular vectors of those residuals,
+    weighted by sqrt(cluster size), become the extra rows. Refusal is a low-
+    dimensional cone rather than one vector (Wollschlager et al., 2025, "The Geometry
+    of Refusal in LLMs"); categories that refuse through a different direction (e.g.
+    self-harm vs. hacking) show up as separate clusters.
+    """
+    harmful_mean, harmless_mean = _per_layer_means(harmful, harmless)
+    raw = _unit_normalize(harmful_mean - harmless_mean)
+    primary = purify_direction(raw, harmless_mean) if purified else raw
+    num_layers, _, hidden = harmful.activations.shape
+    out = torch.zeros(num_layers, k, hidden)
+    for layer in range(num_layers):
+        acts = harmful.activations[layer]
+        base = harmless_mean[layer]
+        labels = _kmeans(acts - base, n_clusters, seed=seed)
+        diffs, weights = [], []
+        for j in range(n_clusters):
+            mask = labels == j
+            if mask.sum() < 2:
+                continue
+            diffs.append(acts[mask].mean(0) - base)
+            weights.append(mask.sum().float().sqrt())
+        rows = [primary[layer]]
+        if diffs:
+            m = torch.stack(diffs)
+            m = _project_out(m, primary[layer].unsqueeze(0))
+            if purified:
+                m = _project_out(m, _unit_normalize(base).unsqueeze(0))
+            m = m * torch.stack(weights).unsqueeze(1)
+            _, _, vh = torch.linalg.svd(m, full_matrices=False)
+            for v in vh[: k - 1]:
+                # sign: point the extra direction toward the harmful side
+                if (m @ v).sum() < 0:
+                    v = -v
+                rows.append(v)
+        basis = torch.stack(rows)
+        # final Gram-Schmidt for exact orthonormality
+        q = []
+        for v in basis:
+            for r in q:
+                v = v - (v @ r) * r
+            if v.norm() > 1e-8:
+                q.append(v / v.norm())
+        out[layer, : len(q)] = torch.stack(q)
+    return out
