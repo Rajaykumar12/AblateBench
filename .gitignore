@@ -8,3 +8,6 @@ docs/
 
 # graphify knowledge graph (local, rebuilt by git hooks)
 graphify-out/
+
+# Local sweep/optimize/compare outputs
+sweep-results/
