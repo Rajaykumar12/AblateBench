@@ -149,3 +149,29 @@ def test_get_residual_write_modules_finds_both_projections():
     model = _TinyModel(hidden_dim=4, num_layers=1)
     modules = get_residual_write_modules(model.model.layers[0])
     assert len(modules) == 2
+
+
+def test_norm_preserving_edit_writes_nothing_along_the_direction():
+    """preserve_norms must keep d_hat^T W' = 0. Rescaling the d_model-indexed rows
+    (the old behaviour) re-introduced part of d_hat into every output."""
+    torch.manual_seed(0)
+    d_model, inner, experts = 16, 8, 3
+    d_hat = torch.randn(d_model)
+    d_hat = d_hat / d_hat.norm()
+    cases = [
+        (torch.randn(d_model, inner), lambda w: d_hat @ w),
+        (torch.randn(experts, d_model, inner), lambda w: torch.einsum("i,eik->ek", d_hat, w)),
+        (torch.randn(experts, inner, d_model), lambda w: w @ d_hat),
+    ]
+    for weight, along_d in cases:
+        new_w = orthogonalize_matrix(weight, d_hat, preserve_norms=True)
+        assert along_d(new_w).abs().max() < 1e-5, tuple(weight.shape)
+
+
+def test_norm_preserving_edit_restores_input_column_norms():
+    torch.manual_seed(1)
+    d_hat = torch.randn(16)
+    d_hat = d_hat / d_hat.norm()
+    w = torch.randn(16, 8)
+    new_w = orthogonalize_matrix(w, d_hat, preserve_norms=True)
+    assert torch.allclose(new_w.norm(dim=0), w.norm(dim=0), atol=1e-4)

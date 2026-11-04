@@ -171,7 +171,10 @@ def run_ablation_sweep(
     for layer_idx in layer_shortlist:
         # broadcast this candidate layer's direction to every layer of the model —
         # the model-wide intervention the technique actually requires.
-        broadcast_directions = directions[layer_idx].unsqueeze(0).expand(num_layers, -1)
+        # ([L, hidden] single directions or [L, k, hidden] refusal subspaces)
+        broadcast_directions = directions[layer_idx].unsqueeze(0).expand(
+            num_layers, *directions.shape[1:]
+        )
         for coeff in coefficient_shortlist:
             handles = install_ablation_hooks(
                 model, broadcast_directions, coefficient=coeff, layer_indices=None

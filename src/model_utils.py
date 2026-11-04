@@ -31,6 +31,10 @@ _POST_NORM_FOR_PROJECTION = {
 
 _SANDWICH_NORM_MARKER = "post_feedforward_layernorm"
 
+# Which sub-block each residual write belongs to, so attention and MLP/expert writes
+# can be ablated with separate per-layer weights (ablate_weights_ attn/mlp weights).
+_ATTENTION_PROJECTIONS = {"self_attn.o_proj", "linear_attn.out_proj"}
+
 
 def get_decoder_layers(model: nn.Module) -> list[nn.Module]:
     """Return the ordered list of decoder-layer modules for a HF causal LM."""
@@ -63,8 +67,17 @@ def get_residual_write_modules_with_post_norms(
     the residual add (Gemma 2/3 sandwich norms), or None for pre-norm architectures.
     Handles standard 2D projections, linear_attn, ModuleList MoEs, and 3D packed MoEs.
     """
+    return [(proj, norm) for proj, norm, _ in get_residual_writes_by_kind(layer)]
+
+
+def get_residual_writes_by_kind(
+    layer: nn.Module,
+) -> list[tuple[nn.Module | nn.Parameter, nn.Module | None, str]]:
+    """Like get_residual_write_modules_with_post_norms, plus each write's kind:
+    "attn" (attention / linear-attention output) or "mlp" (dense MLP, shared expert,
+    routed experts)."""
     sandwich = hasattr(layer, _SANDWICH_NORM_MARKER)
-    pairs: list[tuple[nn.Module | nn.Parameter, nn.Module | None]] = []
+    pairs: list[tuple[nn.Module | nn.Parameter, nn.Module | None, str]] = []
 
     for dotted_name in _RESIDUAL_WRITE_PROJECTIONS:
         obj = layer
@@ -78,7 +91,8 @@ def get_residual_write_modules_with_post_norms(
             if sandwich
             else None
         )
-        pairs.append((obj, post_norm))
+        kind = "attn" if dotted_name in _ATTENTION_PROJECTIONS else "mlp"
+        pairs.append((obj, post_norm, kind))
 
     # Handle MoE routed experts (both ModuleList of Linear and packed 3D Parameter)
     if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
@@ -88,11 +102,11 @@ def get_residual_write_modules_with_post_norms(
         if isinstance(experts, nn.ModuleList):
             for exp in experts:
                 if hasattr(exp, "down_proj") and isinstance(exp.down_proj, nn.Module):
-                    pairs.append((exp.down_proj, mlp_post_norm))
+                    pairs.append((exp.down_proj, mlp_post_norm, "mlp"))
         else:
             for name, param in experts.named_parameters(recurse=False):
                 if "down_proj" in name and param.dim() == 3:
-                    pairs.append((param, mlp_post_norm))
+                    pairs.append((param, mlp_post_norm, "mlp"))
 
     if not pairs:
         raise ValueError(
@@ -100,6 +114,20 @@ def get_residual_write_modules_with_post_norms(
             f"{type(layer).__name__}; tried: {_RESIDUAL_WRITE_PROJECTIONS}"
         )
     return pairs
+
+
+def get_attention_module(layer: nn.Module) -> nn.Module | None:
+    """The attention block (full or linear) whose output is that layer's attention
+    residual write, or None."""
+    for name in ("self_attn", "linear_attn"):
+        mod = getattr(layer, name, None)
+        if isinstance(mod, nn.Module):
+            return mod
+    return None
+
+
+def has_sandwich_norms(layer: nn.Module) -> bool:
+    return hasattr(layer, _SANDWICH_NORM_MARKER)
 
 
 def unwrap_hidden_state(output) -> torch.Tensor:
