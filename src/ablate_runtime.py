@@ -11,7 +11,13 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from model_utils import get_decoder_layers, rewrap_hidden_state, unwrap_hidden_state
+from model_utils import (
+    get_attention_module,
+    get_decoder_layers,
+    has_sandwich_norms,
+    rewrap_hidden_state,
+    unwrap_hidden_state,
+)
 
 
 def project_out(h: torch.Tensor, d_hat: torch.Tensor, coefficient: float = 1.0) -> torch.Tensor:
@@ -21,6 +27,9 @@ def project_out(h: torch.Tensor, d_hat: torch.Tensor, coefficient: float = 1.0) 
     used by the rescaling step (PRD stage [6]).
     """
     d_hat = d_hat.to(dtype=h.dtype, device=h.device)
+    if d_hat.dim() == 2:
+        # [k, hidden] orthonormal refusal subspace
+        return h - coefficient * (h @ d_hat.T) @ d_hat
     proj = (h @ d_hat).unsqueeze(-1) * d_hat  # [..., hidden]
     return h - coefficient * proj
 
@@ -64,3 +73,50 @@ def install_ablation_hooks(
 def remove_hooks(handles: list[torch.utils.hooks.RemovableHandle]) -> None:
     for h in handles:
         h.remove()
+
+
+def install_component_hooks(
+    model: nn.Module,
+    directions: torch.Tensor,
+    attn_weights: list[float],
+    mlp_weights: list[float],
+    embed_weight: float = 0.0,
+) -> list[torch.utils.hooks.RemovableHandle]:
+    """Reversible twin of ablate_weights_(..., attn_weights, mlp_weights,
+    embed_weight, preserve_norms=False): project `directions[i]` out of layer i's
+    attention-block output and MLP/MoE-block output with separate strengths, and
+    out of the token embeddings. Each block's last op is its residual-write
+    projection (o_proj / out_proj / down_proj; MoE gates are scalars), so projecting
+    the block output equals editing those weights. Used by the optimizer, which
+    needs per-component strengths that whole-layer hooks can't express.
+
+    Directions must already be orthonormal per layer ([L, hidden] unit rows or
+    [L, k, hidden] orthonormal rows). Sandwich-norm models (Gemma 2/3) are rejected:
+    there the post-norm sits between the block output and the residual add."""
+    layers = get_decoder_layers(model)
+    if directions.shape[0] != len(layers):
+        raise ValueError(
+            f"directions has {directions.shape[0]} rows but model has {len(layers)} layers"
+        )
+    if any(has_sandwich_norms(layer) for layer in layers):
+        raise NotImplementedError("component hooks do not model sandwich post-norms")
+
+    def make_hook(d_hat: torch.Tensor, strength: float):
+        def hook(module, inputs, output):
+            hidden = unwrap_hidden_state(output)
+            return rewrap_hidden_state(output, project_out(hidden, d_hat, strength))
+
+        return hook
+
+    handles = []
+    if embed_weight:
+        emb = model.get_input_embeddings()
+        handles.append(emb.register_forward_hook(make_hook(directions[0], embed_weight)))
+    for i, layer in enumerate(layers):
+        attn = get_attention_module(layer)
+        if attn is not None and attn_weights[i]:
+            handles.append(attn.register_forward_hook(make_hook(directions[i], attn_weights[i])))
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None and mlp_weights[i]:
+            handles.append(mlp.register_forward_hook(make_hook(directions[i], mlp_weights[i])))
+    return handles

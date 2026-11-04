@@ -82,6 +82,65 @@ def test_sweep_removes_hooks_between_candidates():
         assert len(layer._forward_hooks) == 0
 
 
+def test_grade_refusal_runs_after_hooks_are_removed():
+    """The judge must grade with the clean model: generation happens under the
+    candidate's hooks, grading only once they're gone."""
+    model = _TinyModel(num_layers=2)
+    hooks_at_grade_time = []
+
+    def grade(responses):
+        hooks_at_grade_time.append(sum(len(l._forward_hooks) for l in model.model.layers))
+        return 0.25 if responses == ["generated"] else 1.0
+
+    result = run_ablation_sweep(
+        model,
+        torch.eye(2),
+        measure_refusal_rate=lambda: ["generated"],
+        measure_capability=lambda: 1.0,
+        layer_shortlist=[0],
+        coefficient_shortlist=[1.0],
+        grade_refusal=grade,
+    )
+
+    assert hooks_at_grade_time == [0]
+    assert result.candidates[0].refusal_rate == 0.25
+
+
+def test_band_directions_keeps_own_direction_inside_band_only():
+    from layer_sweep import band_directions
+
+    directions = torch.arange(1.0, 13.0).reshape(6, 2)
+    out = band_directions(directions, "2-4")
+    assert torch.equal(out[2:5], directions[2:5])
+    assert torch.count_nonzero(out[:2]) == 0 and torch.count_nonzero(out[5:]) == 0
+
+
+def test_band_sweep_hooks_only_band_layers_and_grades_after_removal():
+    from layer_sweep import run_band_sweep
+
+    model = _TinyModel(num_layers=5)
+    hooked_during_generation = []
+    hooks_at_grade_time = []
+
+    def generate():
+        hooked_during_generation.append([len(l._forward_hooks) for l in model.model.layers])
+        return ["generated"]
+
+    def grade(responses):
+        hooks_at_grade_time.append(sum(len(l._forward_hooks) for l in model.model.layers))
+        return 0.1
+
+    result = run_band_sweep(
+        model, torch.eye(5), ["1-3"], generate, lambda: 1.0,
+        coefficient_shortlist=[1.0], grade_refusal=grade,
+    )
+
+    assert hooked_during_generation == [[0, 1, 1, 1, 0]]
+    assert hooks_at_grade_time == [0]
+    assert result.as_table_rows()[0]["layer"] == "band:1-3"
+    assert result.candidates[0].refusal_rate == 0.1
+
+
 def test_best_picks_highest_capability_among_candidates_clearing_target():
     from layer_sweep import SweepCandidate, SweepResult
 

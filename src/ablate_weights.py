@@ -1,72 +1,134 @@
 """Stage [5b]: permanent weight-level ablation ("the real abliteration").
 
-Orthogonalizes each residual-stream-writing weight matrix (attention output
-projection, MLP down projection — see model_utils._RESIDUAL_WRITE_PROJECTIONS) with
-respect to the refusal direction, so the direction can no longer be produced by that
-layer at all — no runtime hook required afterward. This is what makes the result
-deployable as a plain checkpoint (PRD §6.2, "Portability of the permanent edit").
-
-Math: for a Linear layer computing `y = W x + b`, the component of `y` along a unit
-vector `d_hat` is `d_hat . y = (d_hat^T W) x + d_hat . b`. Zeroing that identically for
-all `x` requires `d_hat^T W = 0`, which is achieved exactly by:
-
-    W' = W - d_hat (d_hat^T W)      (equivalently: W' = (I - d_hat d_hat^T) W)
-    b' = b - (d_hat . b) d_hat
-
-Applying this to every projection that writes into the residual stream at a layer
-means that layer can no longer inject any component along d_hat into the stream,
-regardless of input — a stronger and more direct claim than "empirically, refusal
-rate drops," and the reason ablate_weights must reproduce ablate_runtime's
-refusal-rate drop with the hook removed (PRD §5, row 4).
-
-Sandwich-norm models (Gemma 2/3) put an RMSNorm between each projection and the
-residual add, so there the projection is orthogonalized against a norm-adjusted
-direction instead - see post_norm_adjusted_direction.
+Directions may be a single unit vector per layer ([hidden]) or a small orthonormal
+refusal subspace per layer ([k, hidden]); both are handled through the projector
+P = Q^T Q, so rank 1 is just the k = 1 case.
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from model_utils import get_decoder_layers, get_residual_write_modules_with_post_norms
+from model_utils import get_decoder_layers, get_residual_writes_by_kind
+
+
+def orthonormal_basis(directions: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """[hidden] or [k, hidden] -> [k', hidden] with orthonormal rows, in float32.
+    Order is kept (row 0 stays the primary direction, up to sign); near-zero rows
+    left after Gram-Schmidt are dropped."""
+    q = directions.float()
+    if q.dim() == 1:
+        q = q.unsqueeze(0)
+    rows: list[torch.Tensor] = []
+    for v in q:
+        for r in rows:
+            v = v - (v @ r) * r
+        n = v.norm()
+        if n > eps:
+            rows.append(v / n)
+    if not rows:
+        return torch.zeros(0, q.shape[-1], dtype=torch.float32, device=q.device)
+    return torch.stack(rows)
 
 
 def post_norm_adjusted_direction(post_norm: nn.Module, d_hat: torch.Tensor) -> torch.Tensor:
-    """Direction to orthogonalize a projection against when an RMSNorm sits between
-    it and the residual add (Gemma 2/3 sandwich norms).
-
-    That norm computes `g * z / rms(z)` with a learned per-channel scale `g`, so the
-    stream sees `d_hat . (g * z) / rms(z) = (g * d_hat) . z / rms(z)`. The scalar
-    1/rms(z) can't create a d_hat component, so zeroing it for every input requires
-    the projection's output z to be orthogonal to `u = normalize(g * d_hat)` - *not*
-    to d_hat itself, which the norm would rescale channel-wise straight back into a
-    d_hat component.
-
-    `g` is read by probing the norm with an all-ones vector (rms(1) = 1, up to eps)
-    rather than from its `.weight`, so this doesn't depend on how a given
-    architecture parameterizes the scale (Gemma stores it as `1 + weight`)."""
-    hidden_dim = d_hat.shape[0]
+    """Direction(s) to orthogonalize a projection against when an RMSNorm sits
+    between it and the residual add (Gemma 2/3 sandwich norms)."""
+    hidden_dim = d_hat.shape[-1]
     param = next(post_norm.parameters())
     ones = torch.ones(1, hidden_dim, dtype=torch.float32, device=param.device)
     g = post_norm(ones).float().squeeze(0)
     u = g * d_hat.to(device=g.device, dtype=torch.float32)
+    if u.dim() == 2:
+        return orthonormal_basis(u)
     norm = u.norm()
     return u / norm if norm > 0 else u
 
 
-def orthogonalize_matrix(weight: torch.Tensor, d_hat: torch.Tensor) -> torch.Tensor:
-    """Return W' = W - d_hat (d_hat^T W), so that d_hat^T W' == 0 (row space of W' is
-    orthogonal to d_hat). `weight` has shape [out_features, in_features]; `d_hat` has
-    shape [out_features]."""
-    d_hat = d_hat.to(dtype=weight.dtype, device=weight.device)
-    proj_row = d_hat @ weight  # [in_features] = d_hat^T W
-    return weight - torch.outer(d_hat, proj_row)
+def orthogonalize_matrix(
+    weight: torch.Tensor,
+    d_hat: torch.Tensor,
+    preserve_norms: bool = False,
+    eps: float = 1e-8,
+    strength: float = 1.0,
+) -> torch.Tensor:
+    """Return W' = W - strength * P W, with P the projector onto `d_hat`'s span
+    (a unit vector [d_model] or orthonormal rows [k, d_model]).
+
+    Supports:
+    - 2D Linear weights: shape [out_features (d_model), in_features]
+    - 3D MoE weights: shape [n_experts, d_model, d_hidden] or [n_experts, d_hidden, d_model]
+
+    When `preserve_norms=True` (grimjim formulation), rescales each *input* column
+    (the d_model-sized vector one input feature writes into the residual stream) back
+    to its original L2 norm. Scaling columns keeps d_hat^T W' = 0. Scaling the
+    d_model-indexed rows instead, as this function used to, multiplies each output
+    coordinate by a different factor and re-introduces part of d_hat into every
+    output, so the "ablated" weights still write the refusal direction.
+    """
+    orig_dtype = weight.dtype
+    w = weight.float()
+    q = orthonormal_basis(d_hat.to(device=weight.device))
+    d_model = q.shape[-1]
+    proj = q.T @ q  # [d_model, d_model]
+
+    if w.dim() == 2 and w.shape[0] == d_model:
+        out_axis = 0
+        w_new = w - strength * (proj @ w)
+    elif w.dim() == 3 and w.shape[1] == d_model:
+        out_axis = 1  # [n_experts, d_model, in_features]
+        w_new = w - strength * torch.einsum("ij,ejk->eik", proj, w)
+    elif w.dim() == 3 and w.shape[2] == d_model:
+        out_axis = 2  # [n_experts, in_features, d_model] (HF packed MoE format)
+        w_new = w - strength * torch.einsum("ekj,ji->eki", w, proj)
+    else:
+        raise ValueError(
+            f"Unsupported weight shape {tuple(weight.shape)} for d_hat of dim {d_model}"
+        )
+    if preserve_norms:
+        orig = w.norm(dim=out_axis, keepdim=True)
+        new = w_new.norm(dim=out_axis, keepdim=True)
+        w_new = w_new * (orig / (new + eps))
+    return w_new.to(dtype=orig_dtype)
 
 
-def orthogonalize_bias(bias: torch.Tensor, d_hat: torch.Tensor) -> torch.Tensor:
-    d_hat = d_hat.to(dtype=bias.dtype, device=bias.device)
-    coeff = (d_hat @ bias)
-    return bias - coeff * d_hat
+def orthogonalize_bias(bias: torch.Tensor, d_hat: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
+    q = orthonormal_basis(d_hat.to(device=bias.device))
+    b = bias.float()
+    return (b - strength * (q.T @ (q @ b))).to(dtype=bias.dtype)
+
+
+@torch.no_grad()
+def orthogonalize_embeddings_(model: nn.Module, d_hat: torch.Tensor, coefficient: float = 1.0) -> bool:
+    """Remove `d_hat`'s span from every token-embedding row in place. The embedding
+    writes the residual stream's initial value, which layer 0's runtime hook also
+    projects out, so the weight edit must cover it to match. Skipped (returns False)
+    when the embedding is tied to the LM head, since editing it would also change the
+    logits."""
+    get_input = getattr(model, "get_input_embeddings", None)
+    embedding = get_input() if callable(get_input) else None
+    if embedding is None:
+        return False
+    get_output = getattr(model, "get_output_embeddings", None)
+    lm_head = get_output() if callable(get_output) else None
+    if lm_head is not None and lm_head.weight is embedding.weight:
+        return False
+    weight = embedding.weight.data
+    q = orthonormal_basis(d_hat.to(device=weight.device))
+    # Chunked: a float32 copy of a 250k-row table would cost GBs of extra VRAM.
+    for chunk in weight.split(65536):
+        rows = chunk.float()
+        chunk.copy_((rows - coefficient * (rows @ q.T) @ q).to(weight.dtype))
+    return True
+
+
+def _per_layer(values, n: int, default: float) -> list[float]:
+    if values is None:
+        return [default] * n
+    values = [float(v) for v in values]
+    if len(values) != n:
+        raise ValueError(f"expected {n} per-layer weights, got {len(values)}")
+    return values
 
 
 @torch.no_grad()
@@ -75,30 +137,56 @@ def ablate_weights_(
     directions: torch.Tensor,
     coefficient: float = 1.0,
     layer_indices: list[int] | None = None,
+    preserve_norms: bool = False,
+    attn_weights: list[float] | None = None,
+    mlp_weights: list[float] | None = None,
+    embed_weight: float | None = None,
 ) -> None:
-    """In-place permanent ablation. `coefficient` blends between the original matrix
-    (0.0) and the fully orthogonalized one (1.0) — mirrors the runtime hook's
-    partial-strength option (PRD stage [6], rescaling) so the same tradeoff curve can
-    be produced for the weight-level edit, not just the runtime one.
+    """In-place permanent ablation.
+
+    `directions`: [num_layers, hidden] or [num_layers, k, hidden] (refusal subspace).
+    `attn_weights` / `mlp_weights`: optional per-layer strengths for attention vs
+    MLP/expert writes (the optimizer's weight kernels); both default to
+    `coefficient`. `embed_weight` defaults to `coefficient` too.
+
+    Note: `preserve_norms` defaults to False so single-layer equivalence unit tests
+    against `ablate_runtime` pass out of the box.
     """
     layers = get_decoder_layers(model)
-    if directions.shape[0] != len(layers):
+    n = len(layers)
+    if directions.shape[0] != n:
         raise ValueError(
-            f"directions has {directions.shape[0]} rows but model has {len(layers)} layers"
+            f"directions has {directions.shape[0]} rows but model has {n} layers"
         )
     if layer_indices is None:
-        layer_indices = list(range(len(layers)))
+        layer_indices = list(range(n))
+    attn_w = _per_layer(attn_weights, n, coefficient)
+    mlp_w = _per_layer(mlp_weights, n, coefficient)
+    embed_w = coefficient if embed_weight is None else embed_weight
+
+    if 0 in layer_indices and torch.count_nonzero(directions[0]) > 0 and embed_w != 0:
+        orthogonalize_embeddings_(model, directions[0], embed_w)
 
     for idx in layer_indices:
         d_hat = directions[idx]
         if torch.count_nonzero(d_hat) == 0:
-            continue  # degenerate layer (see extract_direction.compute_directions)
-        for proj, post_norm in get_residual_write_modules_with_post_norms(layers[idx]):
-            target = d_hat if post_norm is None else post_norm_adjusted_direction(post_norm, d_hat)
-            new_weight = orthogonalize_matrix(proj.weight.data, target)
-            proj.weight.data = (
-                (1 - coefficient) * proj.weight.data + coefficient * new_weight
+            continue
+        for proj, post_norm, kind in get_residual_writes_by_kind(layers[idx]):
+            strength = attn_w[idx] if kind == "attn" else mlp_w[idx]
+            if strength == 0:
+                continue
+            target = (
+                d_hat
+                if post_norm is None
+                else post_norm_adjusted_direction(post_norm, d_hat)
             )
-            if proj.bias is not None:
-                new_bias = orthogonalize_bias(proj.bias.data, target)
-                proj.bias.data = (1 - coefficient) * proj.bias.data + coefficient * new_bias
+            if isinstance(proj, nn.Parameter):
+                proj.data = orthogonalize_matrix(
+                    proj.data, target, preserve_norms=preserve_norms, strength=strength
+                )
+            else:
+                proj.weight.data = orthogonalize_matrix(
+                    proj.weight.data, target, preserve_norms=preserve_norms, strength=strength
+                )
+                if getattr(proj, "bias", None) is not None:
+                    proj.bias.data = orthogonalize_bias(proj.bias.data, target, strength)
