@@ -812,6 +812,7 @@ def run_full_pipeline(
     band: str = "",
     ablation_config_path: str = "",
     subspace_path: str = "",
+    trial: int = -1,
 ):
     """Stages [5a]/[5b]/[6]/[7]/[8] for one model, given the sweep's chosen operating
     point. Produces the refusal-rate + capability tables and the tradeoff curve that
@@ -832,7 +833,8 @@ def run_full_pipeline(
     `ablation_config_path`: JSON written by `--stage optimize`. Only valid with
     `checkpoint_only`: bakes that exact config (fractional direction, subspace
     rank, attention/MLP weight kernels) into the weights, without norm
-    preservation, because that is what the optimizer scored.
+    preservation, because that is what the optimizer scored. `trial` >= 0 picks that
+    optimizer trial instead of the auto-selected best (checkpoint name gets `_t<N>`).
     """
     _add_src_to_path()
     import os
@@ -860,7 +862,10 @@ def run_full_pipeline(
         from ablation_config import AblationConfig, apply_config
 
         opt = _load_json(ablation_config_path)
-        config = AblationConfig.from_dict(opt["best"]["config"])
+        chosen = opt["best"]
+        if trial >= 0:
+            chosen = next(r for r in opt["trials"] if r["trial"] == trial)
+        config = AblationConfig.from_dict(chosen["config"])
         subspace_file = subspace_path or opt.get("subspace_path") or ""
         subspace = (
             torch.load(subspace_file, map_location="cuda") if config.n_directions > 1 else None
@@ -874,10 +879,12 @@ def run_full_pipeline(
         # Same function the optimizer scored with, in its permanent form.
         apply_config(model, config, per_layer_directions, subspace, ranking, reversible=False)
         name = os.path.splitext(os.path.basename(ablation_config_path))[0]
+        if trial >= 0:
+            name += f"_t{trial}"
         checkpoint_path = f"{CACHE_DIR}/checkpoints/{tag}/weight_{name}"
         _save_checkpoint(model, tokenizer, checkpoint_path)
         with open(f"{checkpoint_path}/ablation_config.json", "w") as f:
-            json.dump(opt["best"], f, indent=2)
+            json.dump(chosen, f, indent=2)
         volume.commit()
         print(f"Saved optimized checkpoint to {checkpoint_path}")
         return {"checkpoints_saved": {"weight": checkpoint_path}}
@@ -1869,6 +1876,7 @@ def main(
     gsm8k_questions: int = 200,
     thinking_per_category: int = 6,
     thinking_max_new_tokens: int = 1024,
+    trial: int = -1,
 ):
     """Convenience CLI: `modal run modal_app.py --stage <stage> [--gpu H100] ...`.
 
@@ -1963,6 +1971,7 @@ def main(
             band=band,
             ablation_config_path=ablation_config,
             subspace_path=subspace_path,
+            trial=trial,
         )
     elif stage == "flagship":
         on_gpu(flagship_run).remote(model_name, layer=best_layer if best_layer >= 0 else None)
