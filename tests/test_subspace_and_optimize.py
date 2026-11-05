@@ -5,6 +5,8 @@ and per-layer attention / MLP strengths, on a toy MoE with packed experts and a
 shared expert."""
 import copy
 
+import pytest
+
 import torch
 import torch.nn as nn
 
@@ -138,16 +140,27 @@ def test_fractional_direction_interpolates_and_is_unit():
 
 def test_config_round_trip_and_materialize():
     flat = Kernel(1.0, 1.0, 1.0, 10.0)
-    cfg = AblationConfig(direction_index=1.3, n_directions=2, attn=flat, mlp=flat, embed_weight=0.5)
+    cfg = AblationConfig(
+        direction_index=1.3, attn=flat, mlp=flat, embed_weight=0.5, extra_strengths=[0.0, 0.7]
+    )
     assert AblationConfig.from_dict(cfg.to_dict()) == cfg
+    assert cfg.n_directions == 2
     torch.manual_seed(0)
     directions = torch.nn.functional.normalize(torch.randn(4, H), dim=-1)
     subspace = torch.stack([orthonormal_basis(torch.randn(3, H)) for _ in range(4)])
-    basis = config_basis(cfg, directions, subspace)
-    assert basis.shape == (2, H)
+    basis, strengths = config_basis(cfg, directions, subspace)
+    assert basis.shape == (2, H) and strengths.tolist() == pytest.approx([1.0, 0.7])
     assert torch.allclose(basis @ basis.T, torch.eye(2), atol=1e-5)
-    per_layer, aw, mw = materialize(cfg, directions, 4, subspace)
-    assert per_layer.shape == (4, 2, H) and aw == [1.0] * 4 and mw == [1.0] * 4
+    m = materialize(cfg, directions, 4, subspace)
+    assert m.basis.shape == (4, 2, H) and m.attn_weights == [1.0] * 4 and m.mlp_weights == [1.0] * 4
+
+
+def test_old_configs_with_n_directions_still_load():
+    flat = {"max_weight": 1.0, "max_weight_position": 1.0, "min_weight": 1.0, "min_weight_distance": 9.0}
+    cfg = AblationConfig.from_dict(
+        {"direction_index": 2.0, "n_directions": 3, "attn": flat, "mlp": flat, "embed_weight": 0.3}
+    )
+    assert cfg.extra_strengths == [1.0, 1.0] and cfg.router_strength == 0.0
 
 
 def test_refusal_subspace_recovers_a_second_cluster_direction():
@@ -170,3 +183,159 @@ def test_refusal_subspace_recovers_a_second_cluster_direction():
     for axis in (a, b):
         u = axis / axis.norm()
         assert (proj @ u).norm() > 0.95
+
+
+def test_per_direction_strengths_match_between_hooks_and_weights():
+    torch.manual_seed(2)
+    model = _ToyMoE()
+    edited = copy.deepcopy(model)
+    q = _basis(3)
+    directions = q.unsqueeze(0).expand(4, -1, -1).contiguous()
+    rs = torch.tensor([1.0, 0.4, 1.3])
+    aw, mw = [1.0, 0.5, 1.2, 0.0], [0.8, 1.0, 0.3, 1.1]
+    ids = torch.randint(0, 20, (2, 5))
+    handles = install_component_hooks(model, directions, aw, mw, 0.6, row_strengths=rs)
+    with torch.no_grad():
+        hooked = model(ids)
+    remove_hooks(handles)
+    ablate_weights_(edited, directions, attn_weights=aw, mlp_weights=mw, embed_weight=0.6, row_strengths=rs)
+    with torch.no_grad():
+        assert torch.allclose(hooked, edited(ids), atol=1e-5)
+
+
+def test_zero_strength_row_is_a_no_op_for_that_direction():
+    q = _basis(2)
+    w = torch.randn(H, INNER)
+    only_first = orthogonalize_matrix(w, q[:1])
+    with_zero = orthogonalize_matrix(w, q, row_strengths=torch.tensor([1.0, 0.0]))
+    assert torch.allclose(only_first, with_zero, atol=1e-6)
+
+
+def _flat_cfg(**kw):
+    flat = Kernel(1.0, 1.5, 0.6, 3.0)
+    return AblationConfig(direction_index=1.4, attn=flat, mlp=flat, embed_weight=0.5, **kw)
+
+
+def test_apply_config_reversible_equals_permanent_with_router_edits():
+    from ablation_config import apply_config
+
+    torch.manual_seed(3)
+    model = _ToyMoE()
+    permanent = copy.deepcopy(model)
+    original = copy.deepcopy(model)
+    directions = torch.nn.functional.normalize(torch.randn(4, H), dim=-1)
+    subspace = torch.stack([orthonormal_basis(torch.randn(3, H)) for _ in range(4)])
+    ranking = [(0, 1), (2, 3), (1, 0)]
+    cfg = _flat_cfg(extra_strengths=[0.8, 0.0], router_strength=0.9, damp_experts=2, damp_alpha=0.5)
+    ids = torch.randint(0, 20, (2, 6))
+
+    undo = apply_config(model, cfg, directions, subspace, ranking, reversible=True)
+    with torch.no_grad():
+        trial = model(ids)
+    undo()
+    apply_config(permanent, cfg, directions, subspace, ranking, reversible=False)
+    with torch.no_grad():
+        assert torch.allclose(trial, permanent(ids), atol=1e-5)
+        # undo restores the model exactly
+        assert torch.equal(model(ids), original(ids))
+
+
+def test_router_orthogonalization_makes_routing_blind_to_the_direction():
+    from moe_router import RouterEdit
+
+    torch.manual_seed(4)
+    model = _ToyMoE()
+    d = torch.nn.functional.normalize(torch.randn(H), dim=0)
+    RouterEdit(model).orthogonalize_routers(d.unsqueeze(0), [1.0] * 4)
+    gate = model.model.layers[0].mlp.gate
+    x = torch.randn(5, H)
+    with torch.no_grad():
+        assert torch.allclose(gate(x), gate(x + 3.0 * d), atol=1e-5)
+
+
+def test_router_orthogonalization_accounts_for_the_norm_scale():
+    """With a zero-centered RMSNorm (x / rms(x) * (1 + w)) in front of the router, the
+    edited router must give the same logits as the original router fed the normalized
+    input with the refusal component removed *before* the per-channel scale:
+    W'(g * x/rms) == W(g * P(x/rms)), P = I - d d^T."""
+    from moe_router import RouterEdit
+
+    class _Norm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(H) * 0.5)
+
+        def forward(self, x):
+            return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * (1 + self.weight)
+
+    torch.manual_seed(5)
+    model = _ToyMoE()
+    layer = model.model.layers[0]
+    layer.post_attention_layernorm = _Norm()
+    original_w = layer.mlp.gate.weight.detach().clone()
+    d = torch.nn.functional.normalize(torch.randn(H), dim=0)
+    RouterEdit(model).orthogonalize_routers(d.unsqueeze(0), [1.0] * 4)
+    x = torch.randn(5, H) + 2.0 * d
+    with torch.no_grad():
+        g = 1 + layer.post_attention_layernorm.weight
+        x_hat = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+        x_hat_p = x_hat - (x_hat @ d).unsqueeze(1) * d
+        edited = (g * x_hat) @ layer.mlp.gate.weight.T
+    # equality holds for the d-induced signal; the edit also drops whatever else lies
+    # along normalize(g*d), so compare on inputs where that is the only difference
+    u = torch.nn.functional.normalize(g * d, dim=0)
+    delta = (g * x_hat - g * x_hat_p)
+    assert torch.allclose(delta - (delta @ u).unsqueeze(1) * u, torch.zeros_like(delta), atol=1e-5)
+    with torch.no_grad():
+        resid = (g * x_hat_p) - ((g * x_hat_p) @ u).unsqueeze(1) * u
+        assert torch.allclose(edited, resid @ original_w.T, atol=1e-4)
+        assert not torch.allclose(edited, (g * x_hat) @ original_w.T, atol=1e-3)
+
+
+def test_damping_scales_only_the_listed_experts_and_restores():
+    from moe_router import RouterEdit
+
+    torch.manual_seed(6)
+    model = _ToyMoE()
+    before = model.model.layers[1].mlp.experts.down_proj.detach().clone()
+    edit = RouterEdit(model)
+    edit.damp_experts([(1, 2)], 0.25)
+    after = model.model.layers[1].mlp.experts.down_proj
+    assert torch.allclose(after[2], 0.75 * before[2])
+    assert torch.equal(after[0], before[0])
+    edit.restore()
+    assert torch.equal(model.model.layers[1].mlp.experts.down_proj, before)
+
+
+def test_routing_profile_and_ranking():
+    from moe_router import profile_routing, rank_refusal_experts
+
+    class _Tok:
+        chat_template = None
+
+        def __call__(self, texts, return_tensors=None, padding=True, add_special_tokens=False):
+            ids = [[len(w) % 20 for w in t.split()] for t in texts]
+            n = max(map(len, ids))
+            pad = [[0] * (n - len(i)) + i for i in ids]
+            mask = [[0] * (n - len(i)) + [1] * len(i) for i in ids]
+
+            class _Enc(dict):
+                def to(self, device):
+                    return self
+
+            return _Enc(ids=torch.tensor(pad), attention_mask=torch.tensor(mask))
+
+    class _Wrapped(_ToyMoE):
+        config = type("C", (), {"num_experts_per_tok": 2})()
+
+        def forward(self, ids, attention_mask=None):
+            return super().forward(ids)
+
+    torch.manual_seed(7)
+    model = _Wrapped()
+    freq = profile_routing(model, _Tok(), ["a bb ccc", "dddd e"], batch_size=2, device="cpu")
+    assert freq.shape == (4, E)
+    assert torch.allclose(freq.sum(dim=1), torch.ones(4), atol=1e-5)  # top-k slots sum to 1
+    harm = torch.tensor([[0.5, 0.1, 0.2, 0.2]])
+    safe = torch.tensor([[0.2, 0.1, 0.4, 0.3]])
+    assert rank_refusal_experts(harm, safe) == [(0, 0)]
