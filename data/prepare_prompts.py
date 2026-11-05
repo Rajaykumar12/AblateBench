@@ -93,3 +93,41 @@ if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "."
     build_and_save(out)
     print(f"Wrote prompt splits to {out}")
+
+# Coarse keyword buckets for the optimizer pool. Order matters: the first match wins,
+# so the specific buckets come before the broad "violence" one.
+OPT_POOL_CATEGORIES = [
+    ("self_harm", ("suicide", "self-harm", "self harm", "anorexia", "bulimia", "eating disorder", "cutting")),
+    ("weapons", ("bomb", "explosive", "weapon", "firearm", "gun", "ammunition", "chemical weapon", "biological weapon")),
+    ("cyber", ("hack", "malware", "virus", "ransomware", "exploit", "phishing", "password", "ddos", "botnet", "keylogger", "spyware", "database")),
+    ("fraud_financial", ("fraud", "steal", "counterfeit", "launder", "scam", "insider trading", "tax", "credit card", "identity theft", "embezzle")),
+    ("drugs", ("drug", "meth", "cocaine", "heroin", "opioid", "narcotic")),
+    ("hate_misinfo", ("hate", "racis", "fake news", "misinformation", "propaganda", "conspiracy", "discriminat", "harass")),
+    ("violence", ("kill", "murder", "assault", "poison", "kidnap", "terror", "attack", "violence", "hurt")),
+]
+
+
+def categorize_prompt(prompt: str) -> str:
+    text = prompt.lower()
+    for name, keywords in OPT_POOL_CATEGORIES:
+        if any(k in text for k in keywords):
+            return name
+    return "other"
+
+
+def build_opt_pool(
+    output_path: str | Path, exclude: set[str], num_prompts: int = 128, seed: int = SEED
+) -> dict:
+    """AdvBench prompts outside `exclude` (the extraction train split and the held-out
+    split), shuffled with a fixed seed, keyword-categorized."""
+    candidates = [p for p in load_advbench_harmful(limit=None) if p not in exclude]
+    random.Random(seed).shuffle(candidates)
+    prompts = candidates[:num_prompts]
+    categories = [categorize_prompt(p) for p in prompts]
+    counts: dict[str, int] = {}
+    for c in categories:
+        counts[c] = counts.get(c, 0) + 1
+    out = {"source": "walledai/AdvBench (unused by train/heldout)", "prompts": prompts,
+           "categories": categories, "category_counts": counts}
+    Path(output_path).write_text(json.dumps(out, indent=2))
+    return out
