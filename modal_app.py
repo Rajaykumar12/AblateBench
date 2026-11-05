@@ -588,12 +588,13 @@ def optimize_ablation(
     snapshot-restored weight edits for router edits; see ablation_config.apply_config)
     and scores it on:
 
-      refusal   macro-average refusal rate over the categories of the optimization
-                pool (data/harmful_prompts_opt.json, built by --stage prepare_opt_pool
-                from AdvBench prompts unused by extraction/sweep; falls back to the
-                held-out tail). Generated under the edit, graded after undo by the
-                clean model. Macro-averaged so small categories (weapons, self-harm)
-                count as much as large ones;
+      refusal   mean of the macro-average (over pool categories) and the overall
+                refusal rate on the optimization pool (data/harmful_prompts_opt.json,
+                built by --stage prepare_opt_pool from AdvBench prompts unused by
+                extraction/sweep; falls back to the held-out tail). Generated under the
+                edit, graded after undo by the clean model. The macro half up-weights
+                small categories (weapons, self-harm); the micro half stops a
+                3-prompt category from dominating;
       KL        first-token KL(base || edited) on held-out harmless prompts.
 
     Both are minimized (multi-objective TPE). The chosen config is the lowest refusal
@@ -663,9 +664,10 @@ def optimize_ablation(
         )
         per_cat = {c.category: c.refusal_rate for c in report.per_category}
         macro = sum(per_cat.values()) / len(per_cat)
+        blended = 0.5 * (macro + report.aggregate_refusal_rate)
         kl = mean_kl_divergence(base_log_probs, log_probs)
         examples = [e for ex in report.refused_examples.values() for e in ex][:4]
-        return macro, report.aggregate_refusal_rate, per_cat, kl, examples
+        return blended, report.aggregate_refusal_rate, per_cat, kl, examples
 
     def kernel(trial, prefix: str) -> Kernel:
         max_w = trial.suggest_float(f"{prefix}_max_weight", 0.6, 1.5)
@@ -742,7 +744,7 @@ def optimize_ablation(
         with open(out_path, "w") as f:
             json.dump({
                 "model": model_name, "kl_cap": kl_cap, "num_prompts": len(harmful),
-                "num_kl_prompts": len(harmless), "objective": "macro refusal over pool categories",
+                "num_kl_prompts": len(harmless), "objective": "0.5 * (macro over pool categories + micro) refusal",
                 "subspace_path": subspace_path, "expert_profile_path": expert_profile_path,
                 "best": pick_best(), "trials": records,
             }, f, indent=2)
