@@ -37,7 +37,7 @@ def _patch_model_calls(monkeypatch, log_probs):
     # refusals: a clear rule-based refusal so no judge is needed
     monkeypatch.setattr(modal_app, "_generate",
                         lambda m, t, prompts, max_new_tokens=128: ["I cannot help with that."] * len(prompts))
-    monkeypatch.setattr(modal_app, "_make_self_judge", lambda m, t: (lambda text: "comply"))
+    monkeypatch.setattr(modal_app, "_make_self_judge", lambda m, t: (lambda text, request=None: "comply"))
     monkeypatch.setattr(modal_app, "_make_patch_fix_judge", lambda m, t: (lambda task, patch: "fixed"))
     # deterministic MCQ correctness: alternating T/F -> 0.5 accuracy everywhere
     monkeypatch.setattr(eval_capability, "score_questions",
@@ -86,7 +86,7 @@ def test_eval_battery_uses_injected_external_judges(monkeypatch, battery_kwargs)
     monkeypatch.setattr(modal_app, "_make_self_judge", _boom)
     monkeypatch.setattr(modal_app, "_make_patch_fix_judge", _boom)
 
-    ext_refusal = lambda text: "refuse"
+    ext_refusal = lambda text, request=None: "refuse"
     ext_patch = lambda task, patch: "not_fixed"
     metrics, _ = modal_app._eval_battery(
         model=None, tokenizer=None, refusal_judge=ext_refusal, patch_judge=ext_patch,
@@ -124,7 +124,7 @@ def test_deferred_grading_uses_the_judge_supplied_later(monkeypatch, battery_kwa
 
     modal_app._grade_battery(
         metrics, battery_kwargs["patch_tasks"],
-        lambda text: "comply", lambda task, patch: "fixed",
+        lambda text, request=None: "comply", lambda task, patch: "fixed",
     )
     assert "_ungraded" not in metrics
     assert metrics["refusal_aggregate"] == 0.0
@@ -158,3 +158,38 @@ def test_cross_model_kl_and_top1_agreement():
     assert mean_kl_divergence(base, shuffled) > 0
     top1_diff = (base.argmax(-1) == shuffled.argmax(-1)).float().mean().item()
     assert top1_diff < 1.0
+
+
+def test_battery_adds_gsm8k_thinking_and_marker_blocks(monkeypatch, battery_kwargs):
+    """Phase 0: GSM8K accuracy, a thinking-mode refusal rate graded on the text after
+    </think> (unfinished replies reported separately), and Heretic-marker rates."""
+    import eval_capability
+    import eval_kl
+
+    def fake_generate(m, t, prompts, max_new_tokens=128, batch_size=8, enable_thinking=False):
+        if enable_thinking:
+            # first prompt finishes and complies, the rest never close the think block
+            return ["<think>ok</think>\n\nHere is how."] + ["<think>long..."] * (len(prompts) - 1)
+        if prompts and prompts[0].startswith("Solve the following"):
+            return ["Answer: 4", "Answer: 5"]
+        return ["Here you go, though this is illegal."] * len(prompts)
+
+    monkeypatch.setattr(modal_app, "_generate", fake_generate)
+    monkeypatch.setattr(eval_capability, "score_questions",
+                        lambda m, t, questions, device="cuda": [True] * len(questions))
+    monkeypatch.setattr(eval_kl, "first_token_log_probs",
+                        lambda m, t, prompts, device="cuda": torch.zeros(len(prompts), 4))
+    metrics, _ = modal_app._eval_battery(
+        model=None, tokenizer=None,
+        refusal_judge=lambda text, request=None: "comply",
+        patch_judge=lambda task, patch: "fixed",
+        gsm8k_questions=[{"question": "2+2", "answer": 4.0}, {"question": "2+2", "answer": 4.0}],
+        thinking_prompts={"cyber": ["p1", "p2"]},
+        **battery_kwargs,
+    )
+    assert metrics["gsm8k"]["accuracy"] == 0.5
+    assert metrics["refusal_thinking"]["unfinished_rate"] == 0.5
+    assert metrics["refusal_thinking"]["aggregate"] == 0.0
+    # "illegal" is a Heretic marker even though the reply complies
+    assert metrics["refusal_heretic_markers"]["aggregate"] == 1.0
+    assert metrics["refusal_aggregate"] == 0.0

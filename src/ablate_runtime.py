@@ -20,7 +20,9 @@ from model_utils import (
 )
 
 
-def project_out(h: torch.Tensor, d_hat: torch.Tensor, coefficient: float = 1.0) -> torch.Tensor:
+def project_out(
+    h: torch.Tensor, d_hat: torch.Tensor, coefficient: float = 1.0, row_strengths=None
+) -> torch.Tensor:
     """h' = h - coefficient * (h . d_hat) d_hat, applied along the last dim.
 
     coefficient=1.0 is full ablation; coefficient<1.0 is the partial-strength variant
@@ -28,8 +30,11 @@ def project_out(h: torch.Tensor, d_hat: torch.Tensor, coefficient: float = 1.0) 
     """
     d_hat = d_hat.to(dtype=h.dtype, device=h.device)
     if d_hat.dim() == 2:
-        # [k, hidden] orthonormal refusal subspace
-        return h - coefficient * (h @ d_hat.T) @ d_hat
+        # [k, hidden] orthonormal refusal subspace, optionally a strength per row
+        coords = h @ d_hat.T
+        if row_strengths is not None:
+            coords = coords * torch.as_tensor(row_strengths, dtype=h.dtype, device=h.device)
+        return h - coefficient * coords @ d_hat
     proj = (h @ d_hat).unsqueeze(-1) * d_hat  # [..., hidden]
     return h - coefficient * proj
 
@@ -81,6 +86,7 @@ def install_component_hooks(
     attn_weights: list[float],
     mlp_weights: list[float],
     embed_weight: float = 0.0,
+    row_strengths=None,
 ) -> list[torch.utils.hooks.RemovableHandle]:
     """Reversible twin of ablate_weights_(..., attn_weights, mlp_weights,
     embed_weight, preserve_norms=False): project `directions[i]` out of layer i's
@@ -104,7 +110,9 @@ def install_component_hooks(
     def make_hook(d_hat: torch.Tensor, strength: float):
         def hook(module, inputs, output):
             hidden = unwrap_hidden_state(output)
-            return rewrap_hidden_state(output, project_out(hidden, d_hat, strength))
+            return rewrap_hidden_state(
+                output, project_out(hidden, d_hat, strength, row_strengths)
+            )
 
         return hook
 

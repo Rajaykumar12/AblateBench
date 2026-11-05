@@ -142,12 +142,15 @@ def rewrap_hidden_state(output, new_hidden: torch.Tensor):
     return new_hidden
 
 
-def format_chat_prompt(tokenizer, prompt: str) -> str:
+def format_chat_prompt(tokenizer, prompt: str, enable_thinking: bool = False) -> str:
+    """Chat-template one user turn. Thinking is off by default everywhere (extraction,
+    sweep, optimizer, compare); `enable_thinking=True` is only for the compare stage's
+    separate thinking-mode refusal check."""
     if getattr(tokenizer, "chat_template", None) is None:
         return prompt
     return tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=False,
+        enable_thinking=enable_thinking,
     )

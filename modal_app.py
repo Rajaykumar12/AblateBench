@@ -100,6 +100,24 @@ def prepare_data(num_harmful: int = 300, num_harmless: int = 300, num_capability
     print(f"Data prepared under {DATA_DIR}")
 
 
+@app.function(image=image, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
+def prepare_opt_pool(num_prompts: int = 128):
+    """Optimizer prompt pool (plan Phase 0): AdvBench prompts not used for direction
+    extraction or the sweep/validation split, tagged with coarse keyword categories so
+    the optimizer can macro-average refusal across them. CPU only."""
+    _add_src_to_path()
+    import os
+
+    os.environ["HF_HOME"] = HF_CACHE_DIR
+    from prepare_prompts import build_opt_pool
+
+    used = set(_load_json(f"{DATA_DIR}/harmful_prompts_train.json"))
+    used |= set(_load_json(f"{DATA_DIR}/harmful_prompts_heldout.json"))
+    out = build_opt_pool(f"{DATA_DIR}/harmful_prompts_opt.json", exclude=used, num_prompts=num_prompts)
+    volume.commit()
+    print(f"Wrote {len(out['prompts'])} optimizer prompts: {out['category_counts']}")
+
+
 def _load_model_and_tokenizer(model_name: str, device: str = "cuda"):
     import os
 
@@ -250,7 +268,7 @@ def _save_checkpoint(model, tokenizer, path: str) -> None:
             print(f"WARNING: checkpoint saved without image processor files: {e}")
 
 
-def _format_chat(tokenizer, prompt: str) -> str:
+def _format_chat(tokenizer, prompt: str, enable_thinking: bool = False) -> str:
     """Delegates to model_utils.format_chat_prompt (also used by extract_direction.py,
     so extraction and generation/judging apply the exact same chat formatting - see
     that function's docstring for why this matters). The local import is required,
@@ -258,7 +276,7 @@ def _format_chat(tokenizer, prompt: str) -> str:
     _add_src_to_path(), which every caller of this function does first."""
     from model_utils import format_chat_prompt
 
-    return format_chat_prompt(tokenizer, prompt)
+    return format_chat_prompt(tokenizer, prompt, enable_thinking=enable_thinking)
 
 
 def _make_self_judge(model, tokenizer):
@@ -364,7 +382,8 @@ def _make_patch_fix_judge(model, tokenizer):
 
 @app.function(image=image, gpu=DEFAULT_GPU, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
 def extract_and_save_direction(
-    model_name: str, output_name: str, purified: bool = False, subspace_k: int = 0
+    model_name: str, output_name: str, purified: bool = False, subspace_k: int = 0,
+    profile_experts: bool = False,
 ):
     """Stages [2]+[3] for one model: extract activations on the train splits, compute
     per-layer directions, save to the volume for reuse by run_sweep / ablation stages
@@ -378,6 +397,12 @@ def extract_and_save_direction(
 
     Also prints the per-layer signal-quality table (gap analysis #3) unconditionally —
     it's free, reusing the same activations already extracted here, no extra GPU cost.
+
+    `profile_experts` (MoE only): also records how often each routed expert is selected
+    on the harmful vs. harmless train prompts and saves `expert_profile_{output_name}.pt`
+    ({freq_harmful, freq_harmless: [layers, experts], ranking: [(layer, expert)...]},
+    ranked by harmful-minus-harmless selection frequency), which the optimizer's
+    expert-damping parameters index into.
     """
     _add_src_to_path()
     import torch
@@ -391,6 +416,22 @@ def extract_and_save_direction(
 
     harmful_acts = extract_activations(model, tokenizer, harmful, device="cuda", batch_size=8)
     harmless_acts = extract_activations(model, tokenizer, harmless, device="cuda", batch_size=8)
+
+    if profile_experts:
+        from moe_router import profile_routing, rank_refusal_experts
+
+        freq_harmful = profile_routing(model, tokenizer, harmful)
+        freq_harmless = profile_routing(model, tokenizer, harmless)
+        ranking = rank_refusal_experts(freq_harmful, freq_harmless)
+        prof_path = f"{CACHE_DIR}/expert_profile_{output_name}.pt"
+        torch.save(
+            {"freq_harmful": freq_harmful, "freq_harmless": freq_harmless, "ranking": ranking},
+            prof_path,
+        )
+        print(f"Saved expert routing profile to {prof_path}; top refusal-associated experts:")
+        for layer_idx, expert in ranking[:12]:
+            h, b = freq_harmful[layer_idx, expert].item(), freq_harmless[layer_idx, expert].item()
+            print(f"  layer {layer_idx:2d} expert {expert:3d}: harmful {h:.4f} vs harmless {b:.4f}")
 
     if subspace_k > 1:
         from extract_direction import compute_refusal_subspace
@@ -530,42 +571,50 @@ def optimize_ablation(
     model_name: str,
     directions_path: str,
     subspace_path: str = "",
-    n_trials: int = 60,
-    n_startup_trials: int = 15,
-    num_prompts: int = 64,
+    expert_profile_path: str = "",
+    seed_config_path: str = "",
+    n_trials: int = 100,
+    n_startup_trials: int = 20,
     num_kl_prompts: int = 64,
     max_new_tokens: int = 96,
     kl_cap: float = 0.15,
     direction_range: str = "",
-    max_directions: int = 3,
+    max_damp_experts: int = 64,
     result_suffix: str = "",
     seed: int = 0,
 ):
-    """Option 1 (Heretic-style): TPE search over ablation configs instead of a
-    one-layer, one-coefficient sweep. Each trial scores a config (fractional
-    direction index, subspace rank 1..max_directions, separate attention / MLP
-    weight kernels over depth, embedding weight) with reversible component hooks:
+    """Heretic-style TPE search over ablation configs (ablation_config.AblationConfig).
+    Each trial applies a config reversibly (component hooks for residual writes,
+    snapshot-restored weight edits for router edits; see ablation_config.apply_config)
+    and scores it on:
 
-      refusal rate  on `num_prompts` held-out harmful prompts, generated under the
-                    hooks and graded after they are removed (clean-model judge);
-      KL            first-token KL(base || ablated) on held-out harmless prompts.
+      refusal   mean of the macro-average (over pool categories) and the overall
+                refusal rate on the optimization pool (data/harmful_prompts_opt.json,
+                built by --stage prepare_opt_pool from AdvBench prompts unused by
+                extraction/sweep; falls back to the held-out tail). Generated under the
+                edit, graded after undo by the clean model. The macro half up-weights
+                small categories (weapons, self-harm); the micro half stops a
+                3-prompt category from dominating;
+      KL        first-token KL(base || edited) on held-out harmless prompts.
 
-    Both are minimized (multi-objective TPE). The chosen config is the lowest
-    refusal rate on the Pareto front with KL <= kl_cap (ties -> lower KL). Held-out
-    harmful prompts come after the sweep's first 50, and the compare stage's
-    12-category prompts are never seen, so the reported numbers stay out-of-sample.
-
-    Writes {CACHE_DIR}/optimize_{tag}{suffix}.json: every trial plus "best", which
-    `--stage full --checkpoint-only --ablation-config` turns into a checkpoint.
+    Both are minimized (multi-objective TPE). The chosen config is the lowest refusal
+    with KL <= kl_cap (ties -> lower KL). Search space:
+      - direction index (fractional), attention + MLP strength kernels, embedding strength
+      - with `subspace_path`: an on/off switch and strength for each extra direction
+      - with `expert_profile_path` (MoE): router orthogonalization strength, and the
+        number of top refusal-associated experts to damp and by how much
+    `seed_config_path`: an earlier optimize JSON; its best config is enqueued as trial
+    0 so the search starts from the known-good point.
     """
     _add_src_to_path()
+    import os
     import time
+    from collections import defaultdict
 
     import optuna
     import torch
 
-    from ablate_runtime import install_component_hooks, remove_hooks
-    from ablation_config import AblationConfig, Kernel, materialize
+    from ablation_config import AblationConfig, Kernel, apply_config
     from eval_kl import first_token_log_probs, mean_kl_divergence
     from eval_refusal import evaluate_refusal_by_category
     from model_utils import get_decoder_layers
@@ -573,8 +622,10 @@ def optimize_ablation(
     model, tokenizer = _load_model_and_tokenizer(model_name)
     directions = torch.load(directions_path, map_location="cuda")
     subspace = torch.load(subspace_path, map_location="cuda") if subspace_path else None
-    if subspace is None:
-        max_directions = 1
+    n_extra = 0 if subspace is None else subspace.shape[1] - 1
+    ranking = None
+    if expert_profile_path:
+        ranking = [tuple(p) for p in torch.load(expert_profile_path)["ranking"]]
     num_layers = len(get_decoder_layers(model))
     last = num_layers - 1
     if direction_range:
@@ -582,28 +633,41 @@ def optimize_ablation(
     else:
         lo_idx, hi_idx = 0.25 * last, 0.75 * last
 
-    harmful = _load_json(f"{DATA_DIR}/harmful_prompts_heldout.json")[50 : 50 + num_prompts]
+    pool_path = f"{DATA_DIR}/harmful_prompts_opt.json"
+    if os.path.exists(pool_path):
+        pool = _load_json(pool_path)
+        harmful, categories = pool["prompts"], pool["categories"]
+    else:
+        harmful = _load_json(f"{DATA_DIR}/harmful_prompts_heldout.json")[50:]
+        categories = ["all"] * len(harmful)
+    by_cat: dict[str, list[int]] = defaultdict(list)
+    for i, c in enumerate(categories):
+        by_cat[c].append(i)
+    print(f"Optimization pool: {len(harmful)} prompts, {dict((c, len(v)) for c, v in by_cat.items())}")
     harmless = _load_json(f"{DATA_DIR}/harmless_prompts_heldout.json")[:num_kl_prompts]
     judge_fn = _make_self_judge(model, tokenizer)
     base_log_probs = first_token_log_probs(model, tokenizer, harmless, device="cuda")
 
-    def score(config: AblationConfig) -> tuple[float, float, list[dict]]:
-        basis, attn_w, mlp_w = materialize(config, directions, num_layers, subspace)
-        handles = install_component_hooks(
-            model, basis.to(torch.bfloat16), attn_w, mlp_w, config.embed_weight
-        )
+    def score(config: AblationConfig):
+        undo = apply_config(model, config, directions, subspace, ranking, reversible=True)
         try:
             responses = _generate(
-                model, tokenizer, harmful, max_new_tokens=max_new_tokens, batch_size=16
+                model, tokenizer, harmful, max_new_tokens=max_new_tokens, batch_size=32
             )
             log_probs = first_token_log_probs(model, tokenizer, harmless, device="cuda")
         finally:
-            remove_hooks(handles)
+            undo()
+        responses_by_cat = {c: [responses[i] for i in idx] for c, idx in by_cat.items()}
+        prompts_by_cat = {c: [harmful[i] for i in idx] for c, idx in by_cat.items()}
         report = evaluate_refusal_by_category(
-            {"v": responses}, judge_fn=judge_fn, prompts_by_category={"v": harmful}
+            responses_by_cat, judge_fn=judge_fn, prompts_by_category=prompts_by_cat
         )
+        per_cat = {c.category: c.refusal_rate for c in report.per_category}
+        macro = sum(per_cat.values()) / len(per_cat)
+        blended = 0.5 * (macro + report.aggregate_refusal_rate)
         kl = mean_kl_divergence(base_log_probs, log_probs)
-        return report.aggregate_refusal_rate, kl, report.refused_examples.get("v", [])[:3]
+        examples = [e for ex in report.refused_examples.values() for e in ex][:4]
+        return blended, report.aggregate_refusal_rate, per_cat, kl, examples
 
     def kernel(trial, prefix: str) -> Kernel:
         max_w = trial.suggest_float(f"{prefix}_max_weight", 0.6, 1.5)
@@ -614,40 +678,60 @@ def optimize_ablation(
             min_weight_distance=trial.suggest_float(f"{prefix}_min_weight_distance", 1.0, last),
         )
 
+    def switched(trial, name: str, lo: float, hi: float) -> float:
+        on = trial.suggest_categorical(f"{name}_on", [False, True])
+        value = trial.suggest_float(name, lo, hi)
+        return value if on else 0.0
+
     records: list[dict] = []
 
     def objective(trial):
         config = AblationConfig(
             direction_index=trial.suggest_float("direction_index", lo_idx, hi_idx),
-            n_directions=trial.suggest_int("n_directions", 1, max_directions),
             attn=kernel(trial, "attn"),
             mlp=kernel(trial, "mlp"),
             embed_weight=trial.suggest_float("embed_weight", 0.0, 1.0),
+            extra_strengths=[switched(trial, f"extra_{i}", 0.05, 1.5) for i in range(1, n_extra + 1)],
         )
+        if ranking is not None:
+            config.router_strength = switched(trial, "router_strength", 0.05, 1.5)
+            n_damp = trial.suggest_int("damp_experts", 0, max_damp_experts)
+            config.damp_experts = n_damp
+            config.damp_alpha = trial.suggest_float("damp_alpha", 0.0, 1.0) if n_damp else 0.0
         t0 = time.time()
-        refusal, kl, refused = score(config)
+        macro, micro, per_cat, kl, refused = score(config)
         records.append({
-            "trial": trial.number, "config": config.to_dict(),
-            "refusal_rate": refusal, "kl": kl, "refused_examples": refused,
+            "trial": trial.number, "config": config.to_dict(), "refusal_rate": macro,
+            "refusal_micro": micro, "refusal_by_category": per_cat, "kl": kl,
+            "refused_examples": refused,
         })
         print(
-            f"trial {trial.number:3d}: refusal={refusal:.3f} kl={kl:.4f} "
+            f"trial {trial.number:3d}: refusal={macro:.3f} (micro {micro:.3f}) kl={kl:.4f} "
             f"dir={config.direction_index:.2f} k={config.n_directions} "
+            f"router={config.router_strength:.2f} damp={config.damp_experts}x{config.damp_alpha:.2f} "
             f"({time.time() - t0:.0f}s)"
         )
-        return refusal, kl
+        return macro, kl
 
-    # Seed trial 0 with the sweep's best plain setting (layer 20, flat full strength
-    # everywhere), so the search starts from a known-good point and the result is
-    # directly comparable to the single-layer baseline.
     sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=seed)
     study = optuna.create_study(directions=["minimize", "minimize"], sampler=sampler)
-    flat = {f"{p}_{k}": v for p in ("attn", "mlp") for k, v in (
-        ("max_weight", 1.0), ("max_weight_position", last / 2),
-        ("min_weight_frac", 1.0), ("min_weight_distance", float(last)),
-    )}
-    seed_idx = min(max(20.0, lo_idx), hi_idx)
-    study.enqueue_trial({"direction_index": seed_idx, "n_directions": 1, "embed_weight": 1.0, **flat})
+    if seed_config_path:
+        prev = AblationConfig.from_dict(_load_json(seed_config_path)["best"]["config"])
+        params = {"direction_index": min(max(prev.direction_index, lo_idx), hi_idx),
+                  "embed_weight": prev.embed_weight}
+        for prefix, k in (("attn", prev.attn), ("mlp", prev.mlp)):
+            params.update({
+                f"{prefix}_max_weight": min(max(k.max_weight, 0.6), 1.5),
+                f"{prefix}_max_weight_position": k.max_weight_position,
+                f"{prefix}_min_weight_frac": k.min_weight / k.max_weight if k.max_weight else 0.0,
+                f"{prefix}_min_weight_distance": min(max(k.min_weight_distance, 1.0), last),
+            })
+        for i in range(1, n_extra + 1):
+            s = prev.extra_strengths[i - 1] if i <= len(prev.extra_strengths) else 0.0
+            params[f"extra_{i}_on"], params[f"extra_{i}"] = bool(s), (s or 0.5)
+        if ranking is not None:
+            params.update({"router_strength_on": False, "router_strength": 0.5, "damp_experts": 0})
+        study.enqueue_trial(params)
 
     tag = model_name.replace("/", "_")
     out_path = f"{CACHE_DIR}/optimize_{tag}{result_suffix}.json"
@@ -660,7 +744,9 @@ def optimize_ablation(
         with open(out_path, "w") as f:
             json.dump({
                 "model": model_name, "kl_cap": kl_cap, "num_prompts": len(harmful),
-                "num_kl_prompts": len(harmless), "best": pick_best(), "trials": records,
+                "num_kl_prompts": len(harmless), "objective": "0.5 * (macro over pool categories + micro) refusal",
+                "subspace_path": subspace_path, "expert_profile_path": expert_profile_path,
+                "best": pick_best(), "trials": records,
             }, f, indent=2)
         volume.commit()
 
@@ -678,11 +764,12 @@ def optimize_ablation(
 
 
 def _generate(
-    model, tokenizer, prompts: list[str], max_new_tokens: int = 128, batch_size: int = 8
+    model, tokenizer, prompts: list[str], max_new_tokens: int = 128, batch_size: int = 8,
+    enable_thinking: bool = False,
 ) -> list[str]:
     import torch
 
-    formatted = [_format_chat(tokenizer, p) for p in prompts]
+    formatted = [_format_chat(tokenizer, p, enable_thinking) for p in prompts]
     responses = []
     for i in range(0, len(formatted), batch_size):
         batch = formatted[i : i + batch_size]
@@ -697,7 +784,16 @@ def _generate(
             )
         for j in range(len(batch)):
             gen_ids = out[j, enc["input_ids"].shape[1] :]
-            responses.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
+            if not enable_thinking:
+                responses.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
+                continue
+            # Keep </think> (it may be registered as a special token) so the final
+            # answer can be split from the reasoning; drop every other special token.
+            text = tokenizer.decode(gen_ids, skip_special_tokens=False)
+            for tok in tokenizer.all_special_tokens:
+                if tok not in ("<think>", "</think>"):
+                    text = text.replace(tok, "")
+            responses.append(text)
     return responses
 
 
@@ -716,6 +812,7 @@ def run_full_pipeline(
     band: str = "",
     ablation_config_path: str = "",
     subspace_path: str = "",
+    trial: int = -1,
 ):
     """Stages [5a]/[5b]/[6]/[7]/[8] for one model, given the sweep's chosen operating
     point. Produces the refusal-rate + capability tables and the tradeoff curve that
@@ -736,7 +833,8 @@ def run_full_pipeline(
     `ablation_config_path`: JSON written by `--stage optimize`. Only valid with
     `checkpoint_only`: bakes that exact config (fractional direction, subspace
     rank, attention/MLP weight kernels) into the weights, without norm
-    preservation, because that is what the optimizer scored.
+    preservation, because that is what the optimizer scored. `trial` >= 0 picks that
+    optimizer trial instead of the auto-selected best (checkpoint name gets `_t<N>`).
     """
     _add_src_to_path()
     import os
@@ -761,24 +859,32 @@ def run_full_pipeline(
     if ablation_config_path:
         if not checkpoint_only:
             raise ValueError("ablation_config_path is only supported with checkpoint_only")
-        from ablation_config import AblationConfig, materialize
+        from ablation_config import AblationConfig, apply_config
 
         opt = _load_json(ablation_config_path)
-        config = AblationConfig.from_dict(opt["best"]["config"])
+        chosen = opt["best"]
+        if trial >= 0:
+            chosen = next(r for r in opt["trials"] if r["trial"] == trial)
+        config = AblationConfig.from_dict(chosen["config"])
+        subspace_file = subspace_path or opt.get("subspace_path") or ""
         subspace = (
-            torch.load(subspace_path, map_location="cuda")
-            if config.n_directions > 1 else None
+            torch.load(subspace_file, map_location="cuda") if config.n_directions > 1 else None
         )
-        basis, attn_w, mlp_w = materialize(config, per_layer_directions, num_layers, subspace)
-        ablate_weights_(
-            model, basis, attn_weights=attn_w, mlp_weights=mlp_w,
-            embed_weight=config.embed_weight, preserve_norms=False,
-        )
+        ranking = None
+        if config.damp_experts:
+            profile_file = opt.get("expert_profile_path") or ""
+            if not profile_file:
+                raise ValueError("config damps experts but the optimize JSON names no expert profile")
+            ranking = [tuple(p) for p in torch.load(profile_file)["ranking"]]
+        # Same function the optimizer scored with, in its permanent form.
+        apply_config(model, config, per_layer_directions, subspace, ranking, reversible=False)
         name = os.path.splitext(os.path.basename(ablation_config_path))[0]
+        if trial >= 0:
+            name += f"_t{trial}"
         checkpoint_path = f"{CACHE_DIR}/checkpoints/{tag}/weight_{name}"
         _save_checkpoint(model, tokenizer, checkpoint_path)
         with open(f"{checkpoint_path}/ablation_config.json", "w") as f:
-            json.dump(opt["best"], f, indent=2)
+            json.dump(chosen, f, indent=2)
         volume.commit()
         print(f"Saved optimized checkpoint to {checkpoint_path}")
         return {"checkpoints_saved": {"weight": checkpoint_path}}
@@ -1169,6 +1275,9 @@ def _eval_battery(
     refusal_judge=None,
     patch_judge=None,
     defer_grading: bool = False,
+    gsm8k_questions: list[dict] | None = None,
+    thinking_prompts: dict[str, list[str]] | None = None,
+    thinking_max_new_tokens: int = 1024,
 ):
     """Run the full evaluation battery on one already-loaded model and return
     (metrics_dict, first_token_log_probs). Factored out of compare_models so the
@@ -1184,8 +1293,17 @@ def _eval_battery(
 
     `defer_grading`: skip refusal + patch grading and keep the raw generations under
     metrics["_ungraded"], for `_grade_battery` to grade later with another model
-    (compare_models uses the clean baseline as judge for the abliterated outputs)."""
+    (compare_models uses the clean baseline as judge for the abliterated outputs).
+
+    Plan Phase 0 additions, each optional:
+    `gsm8k_questions` ([{question, answer}]): generative math accuracy, which catches
+    multi-step-reasoning damage that log-likelihood MMLU-Pro scoring can miss.
+    `thinking_prompts`: a per-category refusal subset generated with thinking mode
+    on, graded on the final answer after </think> (graded later, like the rest).
+    The Heretic-compatible marker rate is always computed, on the first 100 tokens of
+    each refusal-prompt reply, as Heretic does."""
     from eval_capability import score_questions
+    from eval_refusal import marker_rate_by_category
     from eval_defensive import build_patch_prompts
     from eval_kl import first_token_log_probs
 
@@ -1213,8 +1331,32 @@ def _eval_battery(
 
     log_probs = first_token_log_probs(model, tokenizer, harmless, device="cuda")
 
+    gsm8k = None
+    if gsm8k_questions:
+        from eval_math import GSM8K_PROMPT, score_responses
+
+        math_replies = _generate(
+            model, tokenizer, [GSM8K_PROMPT.format(question=q["question"]) for q in gsm8k_questions],
+            max_new_tokens=512, batch_size=16,
+        )
+        gsm8k = score_responses(math_replies, [q["answer"] for q in gsm8k_questions])
+        gsm8k["samples"] = [r[-300:] for r in math_replies[:2]]
+
+    thinking = None
+    if thinking_prompts:
+        flat = [(c, p) for c, ps in thinking_prompts.items() for p in ps]
+        replies = _generate(
+            model, tokenizer, [p for _, p in flat], max_new_tokens=thinking_max_new_tokens,
+            batch_size=16, enable_thinking=True,
+        )
+        thinking = {"categories": [c for c, _ in flat], "prompts": [p for _, p in flat], "replies": replies}
+
     metrics = {
         "mmlu_pro": mmlu,
+        "refusal_heretic_markers": marker_rate_by_category({
+            c: [_first_tokens(tokenizer, r, 100) for r in responses]
+            for c, responses in responses_by_cat.items()
+        }),
         "defensive": {"security_mcq": security, "vuln_detection": vuln},
         # Raw refusal-prompt generations, so a refusal rate can be checked by eye.
         "sample_refusal_responses": {
@@ -1224,8 +1366,11 @@ def _eval_battery(
             "responses_by_cat": responses_by_cat,
             "prompts_by_cat": category_prompts,
             "patches": patches,
+            "thinking": thinking,
         },
     }
+    if gsm8k is not None:
+        metrics["gsm8k"] = gsm8k
     if not defer_grading:
         _grade_battery(
             metrics, patch_tasks,
@@ -1253,6 +1398,8 @@ def _grade_battery(metrics: dict, patch_tasks: list[dict], refusal_judge, patch_
     # Responses graded as refusals (not just the first two of each category), so
     # a residual refusal rate can be checked for judge false positives by eye.
     metrics["graded_refusals"] = {c: ex[:3] for c, ex in refusal.refused_examples.items()}
+    if raw.get("thinking"):
+        metrics["refusal_thinking"] = _grade_thinking(raw["thinking"], refusal_judge)
     metrics["defensive"]["patch_synthesis"] = {
         "fix_rate": patch["fix_rate"],
         "fixed": patch["fixed"],
@@ -1266,6 +1413,41 @@ def _grade_battery(metrics: dict, patch_tasks: list[dict], refusal_judge, patch_
     ]
 
 
+def _first_tokens(tokenizer, text: str, n: int) -> str:
+    """First n tokens of a reply (Heretic scores markers on 100-token generations)."""
+    if tokenizer is None:
+        return text
+    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    return tokenizer.decode(ids[:n], skip_special_tokens=True) if len(ids) > n else text
+
+
+def _grade_thinking(thinking: dict, refusal_judge) -> dict:
+    """Grade thinking-mode replies on their final answer. Replies that never close
+    the think block within the budget have nothing to grade; they are reported as
+    `unfinished_rate` and left out of the refusal rate."""
+    from eval_refusal import evaluate_refusal_by_category, split_thinking
+
+    finals: dict[str, list[str]] = {}
+    prompts: dict[str, list[str]] = {}
+    unfinished = 0
+    for cat, prompt, reply in zip(thinking["categories"], thinking["prompts"], thinking["replies"]):
+        final, finished = split_thinking(reply)
+        if not finished:
+            unfinished += 1
+            continue
+        finals.setdefault(cat, []).append(final)
+        prompts.setdefault(cat, []).append(prompt)
+    report = evaluate_refusal_by_category(finals, judge_fn=refusal_judge, prompts_by_category=prompts)
+    total = len(thinking["replies"])
+    return {
+        "aggregate": report.aggregate_refusal_rate,
+        "by_category": {c.category: c.refusal_rate for c in report.per_category},
+        "num_prompts": total,
+        "unfinished_rate": unfinished / total if total else 0.0,
+        "graded_refusals": {c: ex[:2] for c, ex in report.refused_examples.items()},
+    }
+
+
 @app.function(image=image, gpu=DEFAULT_GPU, volumes={CACHE_DIR: volume}, timeout=GPU_TIMEOUT_S, secrets=[HF_SECRET])
 def compare_models(
     baseline_id: str,
@@ -1274,9 +1456,12 @@ def compare_models(
     kl_prompts: int = 100,
     defensive_questions: int = 200,
     patch_tasks: int = 50,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 256,
     judge_id: str = "",
     result_suffix: str = "",
+    gsm8k_questions: int = 200,
+    thinking_per_category: int = 6,
+    thinking_max_new_tokens: int = 1024,
 ):
     """Evaluation-only comparison of two *separately published* checkpoints - an
     unabliterated baseline and an already-abliterated model - on the same battery:
@@ -1341,6 +1526,16 @@ def compare_models(
     patch_task_rows = _load_json(patch_path)["tasks"]
     harmless = _load_json(f"{DATA_DIR}/harmless_prompts_heldout.json")[:kl_prompts]
 
+    gsm8k_rows = None
+    if gsm8k_questions:
+        from build_gsm8k_subset import build_and_save as build_gsm8k
+
+        gsm8k_path = f"{DATA_DIR}/gsm8k_{gsm8k_questions}.json"
+        if not os.path.exists(gsm8k_path):
+            build_gsm8k(gsm8k_path, num_questions=gsm8k_questions)
+            volume.commit()
+        gsm8k_rows = _load_json(gsm8k_path)["questions"]
+
     # Refusal prompts: the 12 offensive categories mounted with the image. Measured
     # per category (one refusal rate each) - never ablated or modified here.
     category_dir = "/root/data/eval_categories"
@@ -1370,6 +1565,10 @@ def compare_models(
         max_new_tokens=max_new_tokens,
         refusal_judge=refusal_judge,
         patch_judge=patch_judge,
+        gsm8k_questions=gsm8k_rows,
+        thinking_prompts={c: p[:thinking_per_category] for c, p in category_prompts.items()}
+        if thinking_per_category else None,
+        thinking_max_new_tokens=thinking_max_new_tokens,
     )
 
     # --- abliterated first, grading deferred unless a fixed external judge is loaded;
@@ -1467,7 +1666,22 @@ def compare_models(
             "baseline": base_metrics["graded_refusals"],
             "abliterated": abl_metrics["graded_refusals"],
         },
+        "refusal_heretic_markers": {
+            "baseline": base_metrics["refusal_heretic_markers"],
+            "abliterated": abl_metrics["refusal_heretic_markers"],
+            "note": "Heretic default keyword markers on the first 100 tokens; counts any "
+                    "reply mentioning e.g. 'illegal' or 'disclaimer' as a refusal.",
+        },
+        "max_new_tokens": max_new_tokens,
     }
+    if "gsm8k" in base_metrics:
+        results["gsm8k"] = {"baseline": base_metrics["gsm8k"], "abliterated": abl_metrics["gsm8k"]}
+    if "refusal_thinking" in base_metrics:
+        results["refusal_thinking"] = {
+            "baseline": base_metrics["refusal_thinking"],
+            "abliterated": abl_metrics["refusal_thinking"],
+            "max_new_tokens": thinking_max_new_tokens,
+        }
 
     base_tag = baseline_id.replace("/", "_")
     abl_tag = abliterated_id.replace("/", "_")
@@ -1646,17 +1860,23 @@ def main(
     kl_prompts: int = 100,
     defensive_questions: int = 200,
     patch_tasks: int = 50,
-    max_new_tokens: int = 128,
+    max_new_tokens: int = 256,
     judge_id: str = "",
     method: str = "directional",
     checkpoint_only: bool = False,
     memory_gb: int = 0,
     subspace_k: int = 0,
     n_directions: int = 1,
-    n_trials: int = 60,
+    n_trials: int = 100,
     kl_cap: float = 0.15,
     direction_range: str = "",
     ablation_config: str = "",
+    profile_experts: bool = False,
+    seed_config: str = "",
+    gsm8k_questions: int = 200,
+    thinking_per_category: int = 6,
+    thinking_max_new_tokens: int = 1024,
+    trial: int = -1,
 ):
     """Convenience CLI: `modal run modal_app.py --stage <stage> [--gpu H100] ...`.
 
@@ -1682,6 +1902,12 @@ def main(
     its decorator; Function.with_options is the supported per-call override.
 
     `--method ara` selects the experimental arbitrary-rank optimizer for `full`.
+    Plan phases 0-2 (docs/10): `prepare_opt_pool` builds the categorized optimizer
+    pool; `extract --profile-experts` also saves the MoE routing profile, which
+    `optimize` then uses for router orthogonalization + expert damping;
+    `optimize --seed-config /cache/optimize_<tag>.json` starts from an earlier best.
+    `compare` adds GSM8K (`--gsm8k-questions`, 0 = off), a thinking-mode refusal
+    subset (`--thinking-per-category`, 0 = off) and Heretic-marker refusal counts.
     `--purified` makes sweep/full use directions_purified_{tag}.pt (extract with
     --purified writes both raw and purified files).
     `--checkpoint-only` (with `full`) skips all evals: ablate, save, exit.
@@ -1693,6 +1919,7 @@ def main(
     tag = model_name.replace("/", "_")
     directions_path = f"{CACHE_DIR}/directions_{'purified_' if purified else ''}{tag}.pt"
     subspace_path = f"{CACHE_DIR}/directions_subspace{subspace_k}_{tag}.pt" if subspace_k > 1 else ""
+    expert_profile_path = f"{CACHE_DIR}/expert_profile_{tag}.pt" if profile_experts else ""
 
     def on_gpu(fn):
         options = {}
@@ -1704,11 +1931,14 @@ def main(
 
     if stage == "prepare_data":
         prepare_data.remote()
+    elif stage == "prepare_opt_pool":
+        prepare_opt_pool.remote()
     elif stage == "inspect-model":
         on_gpu(inspect_model).remote(model_name)
     elif stage == "extract":
         on_gpu(extract_and_save_direction).remote(
-            model_name, tag, purified=purified, subspace_k=subspace_k
+            model_name, tag, purified=purified, subspace_k=subspace_k,
+            profile_experts=profile_experts,
         )
     elif stage == "sweep":
         on_gpu(run_sweep).remote(
@@ -1722,8 +1952,9 @@ def main(
     elif stage == "optimize":
         on_gpu(optimize_ablation).remote(
             model_name, directions_path, subspace_path=subspace_path,
+            expert_profile_path=expert_profile_path, seed_config_path=seed_config,
             n_trials=n_trials, kl_cap=kl_cap, direction_range=direction_range,
-            max_directions=max(1, subspace_k), result_suffix=result_suffix,
+            result_suffix=result_suffix,
         )
     elif stage == "full":
         if best_layer < 0 and not band and not ablation_config:
@@ -1740,6 +1971,7 @@ def main(
             band=band,
             ablation_config_path=ablation_config,
             subspace_path=subspace_path,
+            trial=trial,
         )
     elif stage == "flagship":
         on_gpu(flagship_run).remote(model_name, layer=best_layer if best_layer >= 0 else None)
@@ -1758,6 +1990,8 @@ def main(
             mmlu_pro_questions=mmlu_pro_questions, kl_prompts=kl_prompts,
             defensive_questions=defensive_questions, patch_tasks=patch_tasks,
             max_new_tokens=max_new_tokens, judge_id=judge_id, result_suffix=result_suffix,
+            gsm8k_questions=gsm8k_questions, thinking_per_category=thinking_per_category,
+            thinking_max_new_tokens=thinking_max_new_tokens,
         )
     elif stage == "push":
         if not (checkpoint_path and repo_id):

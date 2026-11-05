@@ -51,6 +51,7 @@ def orthogonalize_matrix(
     preserve_norms: bool = False,
     eps: float = 1e-8,
     strength: float = 1.0,
+    row_strengths: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return W' = W - strength * P W, with P the projector onto `d_hat`'s span
     (a unit vector [d_model] or orthonormal rows [k, d_model]).
@@ -65,12 +66,15 @@ def orthogonalize_matrix(
     d_model-indexed rows instead, as this function used to, multiplies each output
     coordinate by a different factor and re-introduces part of d_hat into every
     output, so the "ablated" weights still write the refusal direction.
+
+    `row_strengths` ([k]): optional per-direction strength, so the projector becomes
+    Q^T diag(row_strengths) Q. `d_hat` must then already be orthonormal rows.
     """
     orig_dtype = weight.dtype
     w = weight.float()
     q = orthonormal_basis(d_hat.to(device=weight.device))
     d_model = q.shape[-1]
-    proj = q.T @ q  # [d_model, d_model]
+    proj = _projector(q, row_strengths, d_hat)
 
     if w.dim() == 2 and w.shape[0] == d_model:
         out_axis = 0
@@ -92,14 +96,28 @@ def orthogonalize_matrix(
     return w_new.to(dtype=orig_dtype)
 
 
-def orthogonalize_bias(bias: torch.Tensor, d_hat: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
+def _projector(q: torch.Tensor, row_strengths, d_hat: torch.Tensor) -> torch.Tensor:
+    if row_strengths is None:
+        return q.T @ q
+    rs = torch.as_tensor(row_strengths, dtype=torch.float32, device=q.device).flatten()
+    expected = 1 if d_hat.dim() == 1 else d_hat.shape[0]
+    if q.shape[0] != expected or rs.numel() != q.shape[0]:
+        raise ValueError("row_strengths needs orthonormal, non-degenerate rows, one strength each")
+    return q.T @ (rs.unsqueeze(1) * q)
+
+
+def orthogonalize_bias(
+    bias: torch.Tensor, d_hat: torch.Tensor, strength: float = 1.0, row_strengths=None
+) -> torch.Tensor:
     q = orthonormal_basis(d_hat.to(device=bias.device))
     b = bias.float()
-    return (b - strength * (q.T @ (q @ b))).to(dtype=bias.dtype)
+    return (b - strength * (_projector(q, row_strengths, d_hat) @ b)).to(dtype=bias.dtype)
 
 
 @torch.no_grad()
-def orthogonalize_embeddings_(model: nn.Module, d_hat: torch.Tensor, coefficient: float = 1.0) -> bool:
+def orthogonalize_embeddings_(
+    model: nn.Module, d_hat: torch.Tensor, coefficient: float = 1.0, row_strengths=None
+) -> bool:
     """Remove `d_hat`'s span from every token-embedding row in place. The embedding
     writes the residual stream's initial value, which layer 0's runtime hook also
     projects out, so the weight edit must cover it to match. Skipped (returns False)
@@ -115,10 +133,11 @@ def orthogonalize_embeddings_(model: nn.Module, d_hat: torch.Tensor, coefficient
         return False
     weight = embedding.weight.data
     q = orthonormal_basis(d_hat.to(device=weight.device))
+    proj = _projector(q, row_strengths, d_hat)
     # Chunked: a float32 copy of a 250k-row table would cost GBs of extra VRAM.
     for chunk in weight.split(65536):
         rows = chunk.float()
-        chunk.copy_((rows - coefficient * (rows @ q.T) @ q).to(weight.dtype))
+        chunk.copy_((rows - coefficient * rows @ proj).to(weight.dtype))
     return True
 
 
@@ -141,6 +160,7 @@ def ablate_weights_(
     attn_weights: list[float] | None = None,
     mlp_weights: list[float] | None = None,
     embed_weight: float | None = None,
+    row_strengths: torch.Tensor | None = None,
 ) -> None:
     """In-place permanent ablation.
 
@@ -148,6 +168,8 @@ def ablate_weights_(
     `attn_weights` / `mlp_weights`: optional per-layer strengths for attention vs
     MLP/expert writes (the optimizer's weight kernels); both default to
     `coefficient`. `embed_weight` defaults to `coefficient` too.
+    `row_strengths` ([k]): per-direction strengths within a [L, k, hidden] subspace
+    (rows must be orthonormal); the layer strengths multiply them.
 
     Note: `preserve_norms` defaults to False so single-layer equivalence unit tests
     against `ablate_runtime` pass out of the box.
@@ -165,7 +187,7 @@ def ablate_weights_(
     embed_w = coefficient if embed_weight is None else embed_weight
 
     if 0 in layer_indices and torch.count_nonzero(directions[0]) > 0 and embed_w != 0:
-        orthogonalize_embeddings_(model, directions[0], embed_w)
+        orthogonalize_embeddings_(model, directions[0], embed_w, row_strengths)
 
     for idx in layer_indices:
         d_hat = directions[idx]
@@ -175,18 +197,19 @@ def ablate_weights_(
             strength = attn_w[idx] if kind == "attn" else mlp_w[idx]
             if strength == 0:
                 continue
+            if post_norm is not None and row_strengths is not None:
+                raise NotImplementedError("per-direction strengths with sandwich post-norms")
             target = (
                 d_hat
                 if post_norm is None
                 else post_norm_adjusted_direction(post_norm, d_hat)
             )
+            kw = dict(preserve_norms=preserve_norms, strength=strength, row_strengths=row_strengths)
             if isinstance(proj, nn.Parameter):
-                proj.data = orthogonalize_matrix(
-                    proj.data, target, preserve_norms=preserve_norms, strength=strength
-                )
+                proj.data = orthogonalize_matrix(proj.data, target, **kw)
             else:
-                proj.weight.data = orthogonalize_matrix(
-                    proj.weight.data, target, preserve_norms=preserve_norms, strength=strength
-                )
+                proj.weight.data = orthogonalize_matrix(proj.weight.data, target, **kw)
                 if getattr(proj, "bias", None) is not None:
-                    proj.bias.data = orthogonalize_bias(proj.bias.data, target, strength)
+                    proj.bias.data = orthogonalize_bias(
+                        proj.bias.data, target, strength, row_strengths
+                    )
