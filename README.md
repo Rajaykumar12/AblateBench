@@ -96,4 +96,6 @@ Released models carry this warning on their model cards. If you deploy one, you 
 
 ## License
 
-[MIT](LICENSE)
+- **Code:** [Apache-2.0](LICENSE). See [NOTICE](NOTICE).
+- **Released models:** Apache-2.0, inherited from the Qwen base models. Each model card states its license.
+- **Datasets:** downloaded at runtime and kept under their own licenses. Note that [Alpaca](https://huggingface.co/datasets/tatsu-lab/alpaca) is CC BY-NC 4.0 (non-commercial); check dataset terms before any commercial use.

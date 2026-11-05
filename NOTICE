@@ -1,0 +1,9 @@
+AblateBench
+Copyright 2026 R Ajay Kumar
+
+This product includes software developed by R Ajay Kumar
+(https://github.com/Rajaykumar12/AblateBench).
+
+The refusal keyword list in src/eval_refusal.py (HERETIC_REFUSAL_MARKERS) reproduces
+the default markers of Heretic (https://github.com/p-e-w/heretic) so that results can
+be compared with Heretic-based models.
