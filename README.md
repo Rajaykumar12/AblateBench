@@ -92,10 +92,11 @@ Released models carry this warning on their model cards. If you deploy one, you 
   - MoE and router-level editing
   - grader design
   - testing
+- **[CONTRIBUTING.md](CONTRIBUTING.md)**: how to set up, test and submit changes
 - Arditi et al., [*Refusal in Language Models Is Mediated by a Single Direction*](https://arxiv.org/abs/2406.11717) (2024): the paper this builds on.
 
 ## License
 
-- **Code:** [Apache-2.0](LICENSE). See [NOTICE](NOTICE).
+- **Code:** [Apache-2.0](LICENSE). The refusal keyword list in `src/eval_refusal.py` (`HERETIC_REFUSAL_MARKERS`) reproduces [Heretic](https://github.com/p-e-w/heretic)'s default markers so results are comparable with Heretic-based models.
 - **Released models:** Apache-2.0, inherited from the Qwen base models. Each model card states its license.
 - **Datasets:** downloaded at runtime and kept under their own licenses. Note that [Alpaca](https://huggingface.co/datasets/tatsu-lab/alpaca) is CC BY-NC 4.0 (non-commercial); check dataset terms before any commercial use.
